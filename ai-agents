@@ -38,9 +38,10 @@
 #   prs                                                                          refresh and print pull request status
 #   add-repo <repo|path> [agent] ["description"]                                 register a repo as a new agent
 #                                                                                (a repo name of the organisation is cloned when needed)
-#   handoff <task> <from> <to> "what changed"                                    an agent hands committed work to another one
-#   wait   <task> <agent> <other> "what it needs"                                an agent records that it waits for another one
-#   inbox  <task> <agent>                                                        what other agents handed this agent
+# For agents (they run these from their own session; agent@task reaches an agent of another task):
+#   handoff <agent|all> "what changed"     hand committed work to other agents
+#   wait <agent> "what I need"             ask for something and wait for its handoff
+#   ask <agent> "question" | reply <id> "answer" | send <agent|all> "note" | inbox
 #   orgs                                                                         list your GitHub organisations
 #   org [owner]                                                                  show or set the organisation commands use
 #   remove <task> a[,b] [--force]                                                stop agents and delete their panes and worktrees
@@ -99,6 +100,9 @@ CLAUDE_PROJECTS="${AA_CLAUDE_PROJECTS:-$HOME/.claude/projects}"   # where Claude
 AUTO_RESTART="${AA_AUTO_RESTART:-on}"                     # the watchdog restarts a crashed agent (at most 3 times an hour)
 WATCH_SEC="${AA_WATCH_SEC:-30}"                           # how often the watchdog looks
 STUCK_SEC="${AA_STUCK_SEC:-1200}"                         # "working" without a step for this long counts as stuck
+NUDGE_SEC="${AA_NUDGE_SEC:-60}"                           # a message still not delivered after this long: wake the agent again
+ANSWER_SEC="${AA_ANSWER_SEC:-900}"                        # tell you when a question between agents is unanswered this long
+WAIT_SEC="${AA_WAIT_SEC:-1800}"                           # tell you when an agent waits for another one this long
 REMIND_SEC="${AA_REMIND_SEC:-600}"                        # remind once when an agent waits for you this long
 
 die() { echo "$PROG: $*" >&2; exit 1; }
@@ -320,7 +324,7 @@ read_state() { # <agent>: sets ST, ST_T, ST_D (empty when no hook has reported y
   [[ -f "$(state_file "$1")" ]] && IFS=$'\t' read -r ST ST_T ST_D < "$(state_file "$1")" || true
 }
 hook() { # <task> <agent> <event>: Claude Code calls this; it never fails, and prints only a decision, on fd 3
-  local event="$3" input tool="" what="" msg="" kind=""
+  local event="$3" input tool="" what="" msg="" kind="" mail
   use_task "$1"
   input=$(cat)
   if command -v jq >/dev/null; then
@@ -346,6 +350,17 @@ hook() { # <task> <agent> <event>: Claude Code calls this; it never fails, and p
     StopFailure)            set_state "$2" idle "its turn ended with an error" ;;
     SessionEnd)             set_state "$2" stopped "session ended" ;;
   esac
+  case "$event" in   # new messages from other agents go straight into its context
+    SessionStart|UserPromptSubmit|PostToolUse|Stop)
+      mail=$(mail_deliver "$2")
+      if [[ -z "$mail" ]]; then :
+      elif [[ "$event" == Stop ]]; then
+        set_state "$2" working "reading messages from other agents"
+        jq -n --arg r "$mail" '{decision: "block", reason: $r}' >&3
+      else
+        jq -n --arg e "$event" --arg c "$mail" '{hookSpecificOutput: {hookEventName: $e, additionalContext: $c}}' >&3
+      fi ;;
+  esac
   return 0
 }
 interrupted() { # <agent>: true when the newest session file ends with Claude Code's "interrupted" marker (you pressed Esc)
@@ -365,9 +380,9 @@ end run
 EOF
 }
 LOCKED=""
-lock_task() { # [tries of 0.1 s]: waits until no other command changes this task (agents run start themselves); fails when busy
-  local d="$WT_ROOT/.$TASK.lock" i=0 max="${1:-600}"
-  mkdir -p "$WT_ROOT"
+lock_at() { # <lock dir> [tries of 0.1 s]: waits for the lock; fails when it stays busy
+  local d="$1" i=0 max="${2:-600}"
+  mkdir -p "${d%/*}"
   until mkdir "$d" 2>/dev/null; do
     if [[ -n "$(find "$d" -maxdepth 0 -mmin +5 2>/dev/null)" ]]; then rmdir "$d" 2>/dev/null; continue; fi   # left by a killed command
     i=$((i + 1)); [[ $i -lt $max ]] || return 1
@@ -375,6 +390,7 @@ lock_task() { # [tries of 0.1 s]: waits until no other command changes this task
   done
   LOCKED="$d"
 }
+lock_task() { lock_at "$WT_ROOT/.$TASK.lock" "${1:-600}"; }   # [tries]: one command at a time changes a task (agents run start themselves)
 unlock_task() { [[ -z "$LOCKED" ]] || rmdir "$LOCKED" 2>/dev/null; LOCKED=""; return 0; }
 watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$WT_ROOT/$TASK/watchdog.log"; }
 watch_start() { # starts the task's watchdog unless it already runs
@@ -433,6 +449,7 @@ watch() { # <task>: the loop; it ends when the task's tmux session is gone
   local r
   while session_exists; do
     for r in $(known_roles); do watch_agent "$r" || true; done
+    mail_watch || true
     sleep "$WATCH_SEC"
   done
   rm -f "$WT_ROOT/$TASK/.watch.pid"
@@ -482,81 +499,184 @@ mkwt() { # <repo> <worktree-path> <branch>
 
 
 role_prompt() { # <agent> <goal>
-  local me r
+  local me r list=""
   me=$(agent_name "$1")
+  for r in $(all_roles); do [[ "$r" == "$1" ]] || list+="$r ($(repo_desc "$r")), "; done
   cat <<EOF
 You are the $(repo_desc "$1") agent for task "$TASK": Claude Code session "$me", working in $(basename "$(repo_path "$1")") (this worktree only).
 Goal: $2
 
-Other agents that can work on this task. They may not be running yet:
-EOF
-  for r in $(all_roles); do
-    [[ "$r" == "$1" ]] && continue
-    echo "- \"$(agent_name "$r")\": $(repo_desc "$r"), working in $(basename "$(repo_path "$r")"). Start it with: $PROG start $TASK $r"
-  done
-  cat <<EOF
+Other agents: ${list%, }. Each works in its own repo. "$PROG ls" shows which run now; start one with: $PROG start $TASK <agent>, only when the work needs a change in its repo.
 
-Coordination rules:
-- When you add or change anything another agent depends on (endpoints, GraphQL schema, DTOs, enums, error codes, auth, env vars): commit it, then run: $PROG handoff $TASK $1 <agent> "what changed: exact names and shapes". It records the commit, ends that agent's wait and types the handoff into its session. Never announce work that isn't committed.
-- If you can't go on without another agent's change, run: $PROG wait $TASK $1 <agent> "what you need", then ask it a concrete question with SendMessage instead of guessing. Its handoff ends the wait. Answer questions from other agents promptly.
-- When you start, and after a restart, run: $PROG inbox $TASK $1. It lists what other agents handed you.
-- If you need an agent and ListAgents does not show it, start it with its start command above. Start an agent only when the work needs a change in its repo. Wait until it shows up in ListAgents, then send it what you need.
-- Stop an agent with: $PROG stop $TASK <agent>, but only when I ask, or when its part is done and it has confirmed that.
-- The same start and stop commands work for agents of other tasks when I ask. Add --split or --own only when I ask for a layout. "$PROG ls" shows which agents are running. Never run "$PROG down" or "$PROG remove"; those are for me.
+Working with the other agents (always with these commands, never with SendMessage; they are tracked, and messages for you arrive in your context by themselves, each with an id):
+- When you change anything another agent depends on (endpoints, GraphQL schema, DTOs, enums, error codes, auth, env vars): commit it, then run: $PROG handoff <agent|all> "what changed: exact names and shapes". Never announce work that isn't committed.
+- When you need something from another agent: $PROG wait <agent> "what you need". Its handoff ends the wait.
+- Questions: $PROG ask <agent> "question", and answer every question you get with: $PROG reply <id> "answer". Notes that need no answer: $PROG send <agent|all> "text". Agents of other tasks: <agent>@<task>.
+- "$PROG inbox" lists everything sent to you and what you still wait for.
+- Stop an agent with: $PROG stop $TASK <agent>, but only when I ask, or when its part is done and it has confirmed that. Add --split or --own only when I ask for a layout. Never run "$PROG down" or "$PROG remove"; those are for me.
 - Never ask another agent to do something your own permissions denied; ask me instead.
 - Docker: always use the compose project name in \$COMPOSE_PROJECT_NAME. When the work is done, remove the containers, volumes and networks you started, and stop any dev server you started.
 EOF
 }
 
-# ---- handoffs: an agent hands committed work to another one; an agent can say what it waits for ----
-# <task folder>/handoffs.tsv: "time<TAB>from<TAB>to<TAB>commit<TAB>branch<TAB>what changed"
-# <task folder>/waits.tsv:    "time<TAB>waiting agent<TAB>waits for<TAB>what it needs<TAB>open|done"
-clean_text() { printf '%s' "$1" | tr '[:cntrl:]' ' ' | cut -c1-300; }   # one line, no terminal control codes
-one_role() { local r; r=$(check_roles "$1"); [[ "$r" != *" "* ]] || die "name one agent, not $1"; echo "$r"; }
-open_wait() { # <agent>: "waits for<TAB>what it needs" of its newest open wait, or nothing
-  awk -F'\t' -v w="$1" '$2 == w && $5 == "open" { line = $3 "\t" $4 } END { if (line != "") print line }' "$WT_ROOT/$TASK/waits.tsv" 2>/dev/null || true
+# ---- messages between agents: one durable queue per task ----
+# <task folder>/messages.tsv, one message per line, fields:
+#   1 id  2 time  3 from  4 to  5 kind (note|question|reply|handoff|wait)  6 ref  7 commit  8 branch
+#   9 status (queued, delivered, answered for a question, closed for a wait)  10 delivered at  11 nudges  12 alert sent  13 text
+# "from" is the agent's name, or agent@task when it works on another task. Nothing is ever typed into an agent's input:
+# Claude Code hooks add queued messages to its context (SessionStart, UserPromptSubmit, PostToolUse), and its Stop hook
+# makes it continue with new ones. An idle agent gets a one-line nudge so its next prompt picks them up. The watchdog
+# nudges again and tells you about messages it can't deliver, questions left unanswered and agents waiting too long.
+clean_text() { printf '%s' "$1" | tr '[:cntrl:]' ' ' | cut -c1-500; }   # one line, no terminal control codes
+mail_file() { echo "$WT_ROOT/$1/messages.tsv"; }                        # <task>
+mail_lock() { lock_at "$WT_ROOT/.$1.mail.lock" "${2:-100}"; }            # <task> [tries]
+me_agent() { # the agent session that runs this command: sets ME and the task (agents started by us have AA_AGENT and AA_TASK)
+  [[ -n "${AA_AGENT:-}" && -n "${AA_TASK:-}" ]] || die "run this from an agent session (it reads AA_AGENT and AA_TASK, which $PROG sets for its agents)"
+  check_task "$AA_TASK"; use_task "$AA_TASK"
+  is_role "$AA_AGENT" || die "unknown agent $AA_AGENT"
+  ME="$AA_AGENT"
 }
-agent_wait() { # <me> <other agent> <what I need>
-  local me on what
-  me=$(one_role "$1"); on=$(one_role "$2"); what=$(clean_text "$3")
-  [[ "$me" != "$on" ]] || die "an agent can't wait for itself"
-  [[ -n "${what// }" ]] || die "usage: $PROG wait $TASK <me> <agent> \"what you need from it\""
-  [[ -d "$WT_ROOT/$TASK" ]] || die "task $TASK has no folder"
-  lock_task || die "task $TASK is busy; try again"
-  printf '%s\t%s\t%s\t%s\topen\n' "$(date +%s)" "$me" "$on" "$what" >> "$WT_ROOT/$TASK/waits.tsv"
+resolve_to() { # <agent or agent@task>: sets TO_ROLE and TO_TASK
+  TO_ROLE="${1%@*}"; TO_TASK="$TASK"; [[ "$1" != *@* ]] || TO_TASK="${1#*@}"
+  check_task "$TO_TASK"
+  is_role "$TO_ROLE" || die "unknown agent '$TO_ROLE'; agents: $(all_roles)"
+  [[ -d "$WT_ROOT/$TO_TASK" ]] || die "no task $TO_TASK"
+  [[ "$TO_ROLE@$TO_TASK" != "$ME@$TASK" ]] || die "that is you"
+}
+mail_add() { # <task> <from> <to> <kind> <ref> <commit> <branch> <text>: prints the new id
+  local f id; f=$(mail_file "$1")
+  mail_lock "$1" || die "the messages of task $1 are busy; try again"
+  id=$(awk -F'\t' 'BEGIN { m = 0 } $1 > m { m = $1 } END { print m + 1 }' "$f" 2>/dev/null || echo 1)
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tqueued\t-\t0\t-\t%s\n' "$id" "$(date +%s)" "$2" "$3" "$4" "${5:--}" "${6:--}" "${7:--}" "$8" >> "$f"
   unlock_task
-  echo "recorded: $(agent_name "$me") waits for $(agent_name "$on"). It ends when $on runs: $PROG handoff $TASK $on $me \"...\""
+  echo "$id"
 }
-handoff() { # <from> <to> <what changed>: points the other agent at a commit, ends its wait and tells it
-  local from to what wt sha br msg f="$WT_ROOT/$TASK/waits.tsv"
-  from=$(one_role "$1"); to=$(one_role "$2"); what=$(clean_text "$3")
-  [[ "$from" != "$to" ]] || die "an agent can't hand off to itself"
-  [[ -n "${what// }" ]] || die "usage: $PROG handoff $TASK <from> <to> \"what changed: exact names and shapes\""
-  wt=$(wt_dir "$from"); [[ -d "$wt" ]] || die "$(agent_name "$from") has no worktree in $TASK"
-  # a handoff points at a commit, so the other agent reads exactly what was handed over
-  [[ -z "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]] ||
-    die "commit first: $(agent_name "$from") has uncommitted changes in $wt"
-  sha=$(git -C "$wt" rev-parse --short HEAD); br=$(git -C "$wt" branch --show-current)
-  lock_task || die "task $TASK is busy; try again"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$from" "$to" "$sha" "${br:-detached}" "$what" >> "$WT_ROOT/$TASK/handoffs.tsv"
-  if [[ -f "$f" ]]; then
-    awk -F'\t' -v OFS='\t' -v w="$to" -v o="$from" '$2 == w && $3 == o && $5 == "open" { $5 = "done" } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
-  fi
+mail_set() { # <id> <field> <value> [<field> <value>]: in this task's messages
+  local f; f=$(mail_file "$TASK")
+  mail_lock "$TASK" 20 || return 0
+  awk -F'\t' -v OFS='\t' -v i="$1" -v k="$2" -v v="$3" -v k2="${4:-0}" -v v2="${5:-}" '$1 == i { $k = v; if (k2) $k2 = v2 } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
   unlock_task
-  msg="[handoff from $(agent_name "$from")] $what · commit $sha on branch ${br:-detached}, in $wt"
-  if is_running "$to" && [[ "$(agent_state "$to")" != needs-you ]]; then
-    tmux send-keys -t "$(agent_pane "$to")" -l -- "$msg"; sleep 0.3; tmux send-keys -t "$(agent_pane "$to")" Enter
-    echo "handed $sha to $(agent_name "$to"); the message is in its session"
-  else
-    echo "recorded $sha for $(agent_name "$to"). It isn't taking messages right now; it sees this with: $PROG inbox $TASK $to"
-  fi
 }
-inbox() { # <me>: what other agents handed me, and what I still wait for
-  local me w
-  me=$(one_role "$1")
-  awk -F'\t' -v m="$me" -v p="$PREFIX-" -v t="-$TASK" '$3 == m { n++; printf "handoff from %s%s%s: %s · commit %s on %s\n", p, $2, t, $6, $4, $5 }
-    END { if (!n) print "no handoffs to you yet" }' "$WT_ROOT/$TASK/handoffs.tsv" 2>/dev/null || echo "no handoffs to you yet"
-  w=$(open_wait "$me"); [[ -z "$w" ]] || echo "you still wait for $(agent_name "${w%%$TAB*}"): ${w#*$TAB}"
+sender_wt() { local r="${1%@*}" t="$TASK"; [[ "$1" != *@* ]] || t="${1#*@}"; ( use_task "$t"; wt_dir "$r" ); }   # <from>
+mail_format() { # <message lines>: how the receiving agent reads them
+  local id t from to kind ref sha br st d tr al text
+  echo "[$PROG] New messages for you, $(agent_name "$2"):"
+  while IFS=$'\t' read -r id t from to kind ref sha br st d tr al text; do
+    case "$kind" in
+      handoff)  echo "#$id handoff from $from: $text (commit $sha on branch $br, in $(sender_wt "$from"))" ;;
+      question) echo "#$id question from $from: $text (answer with: $PROG reply $id \"...\")" ;;
+      reply)    echo "#$id answer from $from to your question \"$ref\": $text" ;;
+      wait)     echo "#$id $from waits for you: $text (when it's ready, commit and run: $PROG handoff $from \"what changed\")" ;;
+      *)        echo "#$id note from $from: $text" ;;
+    esac
+  done <<< "$1"
+}
+mail_deliver() { # <agent>: its queued messages, as text for its context; marks them delivered
+  local f out
+  f=$(mail_file "$TASK"); [[ -s "$f" ]] || return 0
+  awk -F'\t' -v a="$1" '$4 == a && $9 == "queued" { f = 1 } END { exit !f }' "$f" || return 0
+  mail_lock "$TASK" 20 || return 0   # busy: the next hook delivers them
+  out=$(awk -F'\t' -v a="$1" '$4 == a && $9 == "queued"' "$f")
+  awk -F'\t' -v OFS='\t' -v a="$1" -v n="$(date +%s)" '$4 == a && $9 == "queued" { $9 = "delivered"; $10 = n } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
+  unlock_task
+  [[ -z "$out" ]] || mail_format "$out" "$1"
+}
+nudge() { # <agent>: an idle agent gets a one-line prompt; its UserPromptSubmit hook then hands it the messages
+  is_running "$1" || return 1
+  [[ "$(agent_state "$1")" == idle ]] || return 1   # working or asking you: its next hook delivers them
+  tmux send-keys -t "$(agent_pane "$1")" -l -- "[$PROG] You have new messages."; sleep 0.3
+  tmux send-keys -t "$(agent_pane "$1")" Enter
+}
+post() { # <agent or agent@task> <kind> <ref> <commit> <branch> <text>: queues a message from ME and wakes the receiver
+  local from id how
+  resolve_to "$1"
+  from="$ME"; [[ "$TO_TASK" == "$TASK" ]] || from="$ME@$TASK"
+  id=$(mail_add "$TO_TASK" "$from" "$TO_ROLE" "$2" "$3" "$4" "$5" "$6")
+  how=$( use_task "$TO_TASK"
+         if nudge "$TO_ROLE"; then echo "it is reading it now"
+         elif is_running "$TO_ROLE"; then echo "it gets it at its next step"
+         else echo "it isn't running and gets it when it starts ($PROG start $TO_TASK $TO_ROLE)"; fi )
+  echo "#$id queued for $(addr_name "$TO_ROLE" "$TO_TASK"); $how"
+}
+addr_name() { ( use_task "$2"; agent_name "$1" ); }   # <agent> <task>
+others() { local r; for r in $(known_roles); do [[ "$r" == "$ME" ]] || printf '%s ' "$r"; done; return 0; }   # this task's other agents
+open_wait() { # <agent>: "who it waits for<TAB>what" of its newest open wait in this task
+  awk -F'\t' -v w="$1" '$5 == "wait" && $3 == w && $9 != "closed" { line = $4 "\t" $13 } END { if (line != "") print line }' "$(mail_file "$TASK")" 2>/dev/null || true
+}
+open_question() { # <agent>: "who asked<TAB>question" of the oldest question delivered to it and not answered
+  awk -F'\t' -v a="$1" '$5 == "question" && $4 == a && $9 == "delivered" { print $3 "\t" $13; exit }' "$(mail_file "$TASK")" 2>/dev/null || true
+}
+queued_count() { awk -F'\t' '$9 == "queued"' "$(mail_file "$TASK")" 2>/dev/null | grep -c . || true; }
+
+mail_cmd() { # <command> <args>: send, ask, reply, handoff, wait, inbox; run by an agent
+  local cmd="$1" to text r wt sha br q from f; shift
+  me_agent
+  case "$cmd" in
+    send|ask|handoff|wait)
+      to="${1:-}"; text=$(clean_text "${2:-}")
+      [[ -n "$to" && -n "${text// }" && $# -eq 2 ]] || die "usage: $PROG $cmd <agent|agent@task$([[ $cmd == send || $cmd == handoff ]] && echo "|all")> \"text\""
+      [[ "$to" != all || "$cmd" == send || "$cmd" == handoff ]] || die "$cmd goes to one agent"
+      [[ "$to" != all || -n "$(others)" ]] || die "this task has no other agents"
+      if [[ "$cmd" == handoff ]]; then   # a handoff points at a commit, so the other agent reads exactly what was handed over
+        wt=$(wt_dir "$ME")
+        [[ -z "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]] || die "commit first: you have uncommitted changes in $wt"
+        sha=$(git -C "$wt" rev-parse --short HEAD); br=$(git -C "$wt" branch --show-current)
+      fi
+      for r in $([[ "$to" == all ]] && others || echo "$to"); do
+        case "$cmd" in
+          send)    post "$r" note - - - "$text" ;;
+          ask)     post "$r" question - - - "$text" ;;
+          wait)    post "$r" wait - - - "$text" ;;
+          handoff) post "$r" handoff - "$sha" "${br:-detached}" "$text"
+                   f=$(mail_file "$TASK")   # the handoff ends the receiver's waits for me
+                   if [[ -s "$f" ]] && mail_lock "$TASK" 50; then
+                     awk -F'\t' -v OFS='\t' -v w="$r" -v me="$ME" '$5 == "wait" && $3 == w && $4 == me && $9 != "closed" { $9 = "closed" } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
+                     unlock_task
+                   fi ;;
+        esac
+      done ;;
+    reply)
+      [[ "${1:-}" =~ ^[0-9]+$ && -n "${2:-}" && $# -eq 2 ]] || die "usage: $PROG reply <id> \"answer\""
+      q=$(awk -F'\t' -v i="$1" -v me="$ME" '$1 == i && $4 == me' "$(mail_file "$TASK")" 2>/dev/null)
+      [[ -n "$q" ]] || die "no message #$1 for you; see them with: $PROG inbox"
+      from=$(cut -f3 <<< "$q"); text=$(clean_text "$2")
+      post "$from" reply "$(cut -f13 <<< "$q" | cut -c1-80)" - - "$text"
+      mail_set "$1" 9 answered ;;
+    inbox)   # everything sent to you, and what you still wait for
+      f=$(mail_file "$TASK")
+      awk -F'\t' -v me="$ME" '$4 == me { n++; printf "#%s %s from %s (%s): %s%s\n", $1, $5, $3, $9, $13, ($7 != "-" ? " · commit " $7 " on " $8 : "") }
+        END { if (!n) print "no messages for you yet" }' "$f" 2>/dev/null || echo "no messages for you yet"
+      awk -F'\t' -v me="$ME" '$3 == me && (($5 == "wait" && $9 != "closed") || ($5 == "question" && $9 != "answered")) {
+        printf "you %s %s: %s\n", ($5 == "wait" ? "still wait for" : "asked, no answer yet from"), $4, $13 }' "$f" 2>/dev/null || true
+      mail_deliver "$ME" >/dev/null ;;   # you have read them now
+  esac
+}
+mail_watch() { # the watchdog: wake agents again, tell you what can't be delivered, what stays unanswered, who waits too long
+  local f now id t from to kind ref sha br st d tr al text
+  f=$(mail_file "$TASK"); [[ -s "$f" ]] || return 0
+  now=$(date +%s)
+  while IFS=$'\t' read -r id t from to kind ref sha br st d tr al text; do
+    [[ -n "$id" ]] || continue
+    if [[ "$st" == queued && $((now - t)) -ge $NUDGE_SEC ]]; then
+      if is_running "$to"; then
+        if [[ $tr -lt 3 ]]; then
+          if nudge "$to"; then mail_set "$id" 11 $((tr + 1)); watch_log "message #$id for $to not delivered yet; woke it again"; fi
+        elif [[ "$al" != undelivered ]]; then
+          mail_set "$id" 12 undelivered; watch_log "message #$id for $to could not be delivered"
+          notify_text "$TASK · message for $to not delivered" "From $from, $(( (now - t) / 60 )) min ago" "$text"
+        fi
+      elif [[ "$al" != stopped ]]; then
+        mail_set "$id" 12 stopped; watch_log "message #$id waits for $to, which isn't running"
+        notify_text "$TASK · message for $to waits" "$to isn't running; it gets it when it starts" "From $from: $text"
+      fi
+    elif [[ "$kind" == question && "$st" == delivered && $((now - d)) -ge $ANSWER_SEC && "$al" != unanswered ]]; then
+      mail_set "$id" 12 unanswered; watch_log "question #$id from $from to $to unanswered"
+      notify_text "$TASK · $to hasn't answered $from" "For $(( (now - d) / 60 )) min" "$text"
+    elif [[ "$kind" == wait && "$st" != closed && $((now - t)) -ge $WAIT_SEC && "$al" != waiting ]]; then
+      mail_set "$id" 12 waiting; watch_log "$from waits for $to since $(( (now - t) / 60 )) min"
+      notify_text "$TASK · $from still waits for $to" "For $(( (now - t) / 60 )) min" "$text"
+    fi
+  done < "$f"
   return 0
 }
 
@@ -591,7 +711,7 @@ overlap_gate() { # <agent> <file path>: stops the first edit of a file another t
   awk -F'\t' -v a="$r" -v p="$rel" -v t="$t" '$2 == a && $3 == p && $4 == t { f = 1 } END { exit !f }' "$f" 2>/dev/null && return 0   # agreed already
   printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$r" "$rel" "$t" >> "$f"
   other="$PREFIX-$r-$t"
-  reason="Stop: $rel is already changed by \"$other\" (task $t, branch $t). Before you edit it, send that agent a message with SendMessage: what you want to change in this file and why, and agree which of you does it. If it doesn't show up in ListAgents, ask me instead. Once you have agreed, make the edit again: it then goes through."
+  reason="Stop: $rel is already changed by \"$other\" (task $t, branch $t). Before you edit it, ask that agent: $PROG ask $r@$t \"what you want to change in $rel and why\", and agree which of you does it. If it isn't running, ask me instead. Once you have agreed, make the edit again: it then goes through."
   jq -n --arg r "$reason" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}' >&3
   [[ "$NOTIFY" == on ]] && notify_text "$TASK · $(repo_desc "$r") overlaps task $t" "$rel" "The agents are asked to agree who changes it."
   return 0
@@ -769,9 +889,9 @@ launch() { # <agent> <fresh|continue>
   # continue the agent's last conversation in its worktree; start fresh only when there is none
   # (not "--continue || fresh": after a crash that would silently throw the conversation away)
   if [[ "$2" == continue ]] && ls "$(proj_dir "$(wt_dir "$1")")"/*.jsonl >/dev/null 2>&1; then
-    tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG; claude ${rc}--continue --name $name" Enter
+    tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG AA_TASK=$TASK AA_AGENT=$1; claude ${rc}--continue --name $name" Enter
   else
-    tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG; claude ${rc}--name $name \"\$(cat $prompt)\"" Enter
+    tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG AA_TASK=$TASK AA_AGENT=$1; claude ${rc}--name $name \"\$(cat $prompt)\"" Enter
   fi
 }
 
@@ -1456,8 +1576,9 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
         crashed)   rank=1; n_stop=$((n_stop + 1)); text="${C_RED}stopped unexpectedly; start it from its actions${C_RESET}"; age="" ;;
         *)         rank=4; n_stop=$((n_stop + 1)); text=""; age="" ;;
       esac
-      wt_on=$(open_wait "$r")   # an idle agent that waits for another one shows what it waits for
-      if [[ -n "$wt_on" && "$st" == idle ]]; then n_wait=$((n_wait + 1)); text="${C_YELLOW}⧗ waiting for ${wt_on%%$TAB*}: ${wt_on#*$TAB}${C_RESET}"; fi
+      wt_on=$(open_wait "$r")   # an idle agent shows what it waits for, or the question it hasn't answered
+      if [[ -n "$wt_on" && "$st" == idle ]]; then n_wait=$((n_wait + 1)); text="${C_YELLOW}⧗ waiting for ${wt_on%%$TAB*}: ${wt_on#*$TAB}${C_RESET}"
+      elif [[ "$st" == idle ]]; then wt_on=$(open_question "$r"); [[ -z "$wt_on" ]] || text="${C_YELLOW}? question from ${wt_on%%$TAB*}: ${wt_on#*$TAB}${C_RESET}"; fi
       [[ $rank -lt $trank ]] && trank=$rank
       info=""
       if [[ "${tk:-0}" -gt 0 ]]; then
@@ -1478,6 +1599,7 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
     [[ $n_idle -gt 0 ]] && head+="${C_CYAN}●${C_RESET} $n_idle idle  "
     [[ $n_wait -gt 0 ]] && head+="${C_YELLOW}⧗ $n_wait waiting for an agent${C_RESET}  "
     ov=$(overlap_tasks); [[ -z "$ov" ]] || head+="${C_YELLOW}⚠ overlap with $ov${C_RESET}  "
+    ov=$(queued_count); [[ "${ov:-0}" -eq 0 ]] || head+="${C_DIM}✉ $ov not delivered yet${C_RESET}  "
     [[ $n_stop -gt 0 ]] && head+="${C_DIM}○ $n_stop stopped${C_RESET}  "
     head+="${C_DIM}·${C_RESET} $(plural "$ch" "changed file")"
     [[ $ttok -gt 0 ]] && head+=" · $(tokens_short "$ttok") tokens · ${C_BOLD}$(money "$tusd" "$MON_RATE")${C_RESET} · ${C_DIM}$(model_list "$models")${C_RESET}"
@@ -2580,9 +2702,7 @@ main() {
     ls) list ;;
     repos) repos ;;
     add-repo) add_repo_cmd "$@" ;;
-    handoff)  check_task "${1:-}"; use_task "$1"; handoff "${2:-}" "${3:-}" "${*:4}" ;;
-    wait)     check_task "${1:-}"; use_task "$1"; agent_wait "${2:-}" "${3:-}" "${*:4}" ;;
-    inbox)    check_task "${1:-}"; use_task "$1"; inbox "${2:-}" ;;
+    send|ask|reply|handoff|wait|inbox) mail_cmd "$cmd" "$@" ;;
     orgs)     owner_lines | while IFS=$'\t' read -r o d; do printf '%s %-24s %s\n' "$([[ "$o" == "$ORG" ]] && echo '*' || echo ' ')" "$o" "$d"; done ;;
     org)      if [[ -n "${1:-}" ]]; then use_org "$1"; remember_org; echo "commands now work in $ORG"; else need_org; echo "$ORG"; fi ;;
     _preview) preview "${1:-}" ;;
