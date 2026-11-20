@@ -27,7 +27,8 @@ Let the agents run the commands they use to work together, without asking you ea
 
 ```json
 "Bash(ai-agents ls)", "Bash(ai-agents start *)", "Bash(ai-agents stop *)",
-"Bash(ai-agents handoff *)", "Bash(ai-agents wait *)", "Bash(ai-agents inbox *)"
+"Bash(ai-agents handoff *)", "Bash(ai-agents wait *)", "Bash(ai-agents inbox)",
+"Bash(ai-agents ask *)", "Bash(ai-agents reply *)", "Bash(ai-agents send *)"
 ```
 
 Optional tmux keys (add to `~/.tmux.conf`):
@@ -48,11 +49,17 @@ bind O run-shell "~/.local/bin/ai-agents monitor-pane '#{pane_id}'"             
 
 Keys in every screen: Enter chooses, Esc or `← Back` goes back, type to search. On the overview: `1`-`8` jump, `m` monitor, `o` switch organisation, `r` refresh, `q` quit.
 
-## How agents hand work to each other
+## How agents work together
 
-An agent that changes something another agent depends on commits it, then runs `ai-agents handoff <task> <from> <to> "what changed"`. That records the commit, types the handoff into the other agent's session, and ends that agent's wait. An agent that is blocked runs `ai-agents wait <task> <me> <other> "what I need"`, and the Monitor shows "⧗ waiting for be: …" until the handoff arrives. `ai-agents inbox <task> <agent>` lists what an agent was handed, for example after a restart.
+Agents talk only through `ai-agents`, so every message is stored, delivered and tracked. Run from an agent's session:
 
-When an agent is about to edit a file that an agent of another task already changed in the same repo, the first edit is stopped and it is told to message that agent and agree who does it. Once they agree, the same edit goes through. The Monitor shows "⚠ overlap with <task>".
+- `handoff <agent|all> "what changed"`: after committing; points the others at the commit and ends their waits.
+- `wait <agent> "what I need"`: the Monitor shows "⧗ waiting for be" until the handoff arrives.
+- `ask <agent> "question"`, `reply <id> "answer"`, `send <agent|all> "note"`, `inbox`. `agent@task` reaches an agent of another task.
+
+Nothing is typed into an agent's input. Claude Code hooks add new messages to its context at its next step, and a turn that ends with messages waiting continues with them. An idle agent gets a one-line wake-up. A stopped agent gets its messages when it starts. The watchdog tells you about messages it can't deliver, questions unanswered for 15 minutes and waits longer than 30 minutes (`AA_ANSWER_SEC`, `AA_WAIT_SEC`).
+
+When an agent is about to edit a file that an agent of another task already changed in the same repo, the first edit is stopped and it is told to ask that agent (`ai-agents ask be@t1 "..."`) and agree who does it. Once they agree, the same edit goes through. The Monitor shows "⚠ overlap with <task>".
 
 ## Commands
 
