@@ -62,3 +62,7 @@ Per organisation in `~/.config/ai-agents/orgs/<owner>/`: `repos` (the agents) an
 Environment variables you may want: `AA_OPEN` (window, tab, here, detached), `AA_LAYOUT` (own, split), `AA_REMOTE` (Remote Control on or off), `AA_NOTIFY`, `AA_AUTO_RESTART`, `AA_CLONE_ROOT` (default `~/code`), `AA_CURRENCY` (or write it to `~/.config/ai-agents/currency`, default USD).
 
 Costs are estimates at Anthropic's API list prices, not your bill.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
