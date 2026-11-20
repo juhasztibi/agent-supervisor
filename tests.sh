@@ -59,7 +59,7 @@ cat > "$T/bin/gh" <<'EOF'
 # fake GitHub CLI: prints what the real one would print after --jq
 case "$1 $2" in
   "api user")       printf 'tester\tyour own repositories\n' ;;
-  "api --paginate") printf 'testorg\tA test organisation\n' ;;
+  "api --paginate") [[ -z "${FAKE_GH_FAIL:-}" ]] || exit 1; printf 'testorg\tA test organisation\n' ;;
   "repo list")      printf 'newrepo\tOnly on GitHub\napi\tThe backend\n' ;;
   "repo clone")     git clone -q "$FAKE_REMOTES/${3#*/}.git" "$4" && git -C "$4" remote set-url origin "https://github.com/$3.git" ;;
   *)                exit 1 ;;
@@ -90,7 +90,7 @@ W="$T/wt"
 pane()    { tmux list-panes -s -t "=tst-$1" -F '#{@agent} #{pane_id}' | awk -v r="$2" '$1 == r { print $2 }'; }
 running() { [[ "$(tmux display-message -p -t "$(pane "$1" "$2")" '#{pane_current_command}')" == sleep ]]; }
 state()   { "$A" _state "$1" "$2"; }
-projdir() { echo "$T/projects/$(printf '%s' "$W/$1/$2" | sed 's/[^A-Za-z0-9]/-/g')"; }
+projdir() { echo "$T/projects/$(printf '%s' "$(cd "$W/$1/$2" && pwd -P)" | sed 's/[^A-Za-z0-9]/-/g')"; }   # like Claude Code: the physical path
 
 # ---------------------------------------------------------------------------
 section "Repositories"
@@ -247,6 +247,76 @@ tmux kill-session -t =tst-t1
 out=$(AA_COLOR= "$A" _header); has "the overview lists it" "Closed unexpectedly" "$out"
 "$A" resume-all >/dev/null 2>&1
 wait_for 6 tmux has-session -t =tst-t1 && ok "resume-all opens it again" || bad "resume-all opens it again"
+
+section "Robustness"
+out=$(/bin/bash "$A" --org emptyorg repos 2>&1); hasnt "an organisation without agents works in bash 3.2" "unbound" "$out"
+out=$(/bin/bash "$A" --org emptyorg start t1 be 2>&1); has "and names the problem" "unknown agent 'be'" "$out"; hasnt "without a bash error" "unbound" "$out"
+out=$("$A" up t7 "a goal" 2>&1); has "up without --only says which agents to name" "--only" "$out"
+check "and leaves no task folder behind" test ! -e "$W/t7"
+out=$("$A" up t7 --only be --goal 2>&1); has "--goal without text is refused" "--goal needs" "$out"
+rm -f "$T/cache/ai-agents/owners.tsv"
+FAKE_GH_FAIL=1 "$A" orgs >/dev/null 2>&1
+check "a half-failed GitHub call is not cached for a day" test ! -s "$T/cache/ai-agents/owners.tsv"
+
+# a resume after tmux closed must not look like a crash to the watchdog
+"$A" up t2 --only be,ui --goal x >/dev/null 2>&1
+wait_for 5 running t2 ui && wait_for 5 grep -q idle "$W/t2/ui.state"
+tmux kill-session -t =tst-t2; : > "$FAKE_LOG"
+"$A" start t2 ui >/dev/null 2>&1   # opens the task again with ui only; be's state still says idle
+sleep 3
+eq "reopening a closed task launches only what you start" "1" "$(grep -c '^args: .*--name tst-[a-z]*-t2' "$FAKE_LOG")"
+hasnt "and the watchdog takes the closed session for no crash" "crashed while" "$(cat "$W/t2/watchdog.log" 2>/dev/null)"
+eq "be counts as stopped" "stopped" "$(state t2 be)"
+
+# a stale watchdog pid that now belongs to another process
+"$A" stop t2 ui >/dev/null 2>&1
+pkill -f "_watch t2" 2>/dev/null; foreign=$(sleep 100 >/dev/null 2>&1 & echo $!); echo "$foreign" > "$W/t2/.watch.pid"
+"$A" start t2 ui >/dev/null 2>&1
+wait_for 3 pgrep -f "_watch t2" && ok "a stale watchdog pid gets a new watchdog" || bad "a stale watchdog pid gets a new watchdog"
+kill "$foreign" 2>/dev/null
+
+# say must not answer a permission prompt
+wait_for 5 running t2 ui
+echo '{"tool_name":"Bash","tool_input":{"command":"git push"}}' | "$A" _hook t2 ui PermissionRequest
+out=$("$A" say t2 ui "1" 2>&1); has "say refuses an agent that waits for your answer" "waiting for your answer" "$out"
+echo '{}' | "$A" _hook t2 ui Stop
+
+# two starts of the same agent at once (agents run start themselves)
+"$A" stop t2 ui >/dev/null 2>&1; : > "$FAKE_LOG"
+mkdir "$W/.t2.lock"; "$A" start t2 ui >/dev/null 2>&1 & sleep 1.5
+eq "a command waits while another one changes the task" "0" "$(grep -c '^args: .*--name tst-ui-t2' "$FAKE_LOG")"
+rmdir "$W/.t2.lock"; wait; wait_for 5 grep -q '^args: .*--name tst-ui-t2' "$FAKE_LOG"
+eq "and runs once the task is free" "1" "$(grep -c '^args: .*--name tst-ui-t2' "$FAKE_LOG")"
+"$A" stop t2 ui >/dev/null 2>&1; : > "$FAKE_LOG"
+"$A" start t2 ui >/dev/null 2>&1 & "$A" start t2 ui >/dev/null 2>&1 & wait
+"$A" start t2 ext >/dev/null 2>&1 & "$A" start t2 ext >/dev/null 2>&1 & wait
+sleep 1   # the fake claude logs a moment after start returns
+eq "two starts at once launch it once" "1" "$(grep -c '^args: .*--name tst-ui-t2' "$FAKE_LOG")"
+eq "and give it one shell" "1" "$(tmux list-panes -t =tst-t2:srv -F '#{@srv}' | grep -c '^ui$')"
+check "two starts at once of a new agent both work" test -d "$W/t2/ext"
+eq "and it gets one shell" "1" "$(tmux list-panes -t =tst-t2:srv -F '#{@srv}' | grep -c '^ext$')"
+"$A" down t2 --prune >/dev/null 2>&1
+
+# a repository without origin/HEAD, and an origin that can't be reached
+git init -q --bare "$T/repos/nohead.git"; git clone -q "$T/repos/nohead.git" "$T/repos/nohead" 2>/dev/null
+git -C "$T/repos/nohead" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init
+git -C "$T/repos/nohead" push -q origin HEAD 2>/dev/null; base=$(git -C "$T/repos/nohead" rev-parse HEAD)
+git -C "$T/repos/nohead" remote set-head origin -d 2>/dev/null; git -C "$T/repos/nohead" config remote.origin.followRemoteHEAD never   # newer git sets it on fetch
+git -C "$T/repos/nohead" checkout -q -b feature; git -C "$T/repos/nohead" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m feature
+"$A" add-repo "$T/repos/nohead" nh >/dev/null 2>&1
+"$A" up t3 --only nh --goal x >/dev/null 2>&1
+eq "without origin/HEAD the task branch starts from origin's default branch" "$base" "$(git -C "$W/t3/nohead" rev-parse HEAD 2>/dev/null)"
+"$A" down t3 --prune >/dev/null 2>&1
+git -C "$T/repos/nohead" remote set-url origin "$T/repos/gone.git"
+out=$("$A" up t4 --only nh --goal x 2>&1); has "an unreachable origin is reported, not fatal" "couldn't fetch" "$out"
+check "and the task starts from local refs" test -d "$W/t4/nohead"
+"$A" down t4 --prune >/dev/null 2>&1
+
+# the script's folder has a space in it
+mkdir -p "$T/a b"; ln -s "$A" "$T/a b/ai-agents"
+"$T/a b/ai-agents" up t6 --only be --goal x >/dev/null 2>&1
+wait_for 5 grep -q idle "$W/t6/be.state" && ok "hooks work when the script's folder has a space" || bad "hooks work when the script's folder has a space" "$(cat "$W/t6/be.state" 2>/dev/null)"
+"$A" down t6 --prune >/dev/null 2>&1
 
 section "Shutting down"
 echo dirty > "$W/t1/api/y.txt"
