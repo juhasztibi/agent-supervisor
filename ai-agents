@@ -38,6 +38,9 @@
 #   prs                                                                          refresh and print pull request status
 #   add-repo <repo|path> [agent] ["description"]                                 register a repo as a new agent
 #                                                                                (a repo name of the organisation is cloned when needed)
+#   handoff <task> <from> <to> "what changed"                                    an agent hands committed work to another one
+#   wait   <task> <agent> <other> "what it needs"                                an agent records that it waits for another one
+#   inbox  <task> <agent>                                                        what other agents handed this agent
 #   orgs                                                                         list your GitHub organisations
 #   org [owner]                                                                  show or set the organisation commands use
 #   remove <task> a[,b] [--force]                                                stop agents and delete their panes and worktrees
@@ -486,14 +489,67 @@ EOF
   cat <<EOF
 
 Coordination rules:
-- When you add or change anything another agent depends on (endpoints, GraphQL schema, DTOs, enums, error codes, auth, env vars), send that agent one short message with SendMessage: what changed, exact names and shapes, and the branch.
-- If you are blocked on another agent's side, ask it a concrete question instead of guessing. Answer questions from other agents promptly.
+- When you add or change anything another agent depends on (endpoints, GraphQL schema, DTOs, enums, error codes, auth, env vars): commit it, then run: $PROG handoff $TASK $1 <agent> "what changed: exact names and shapes". It records the commit, ends that agent's wait and types the handoff into its session. Never announce work that isn't committed.
+- If you can't go on without another agent's change, run: $PROG wait $TASK $1 <agent> "what you need", then ask it a concrete question with SendMessage instead of guessing. Its handoff ends the wait. Answer questions from other agents promptly.
+- When you start, and after a restart, run: $PROG inbox $TASK $1. It lists what other agents handed you.
 - If you need an agent and ListAgents does not show it, start it with its start command above. Start an agent only when the work needs a change in its repo. Wait until it shows up in ListAgents, then send it what you need.
 - Stop an agent with: $PROG stop $TASK <agent>, but only when I ask, or when its part is done and it has confirmed that.
 - The same start and stop commands work for agents of other tasks when I ask. Add --split or --own only when I ask for a layout. "$PROG ls" shows which agents are running. Never run "$PROG down" or "$PROG remove"; those are for me.
 - Never ask another agent to do something your own permissions denied; ask me instead.
 - Docker: always use the compose project name in \$COMPOSE_PROJECT_NAME. When the work is done, remove the containers, volumes and networks you started, and stop any dev server you started.
 EOF
+}
+
+# ---- handoffs: an agent hands committed work to another one; an agent can say what it waits for ----
+# <task folder>/handoffs.tsv: "time<TAB>from<TAB>to<TAB>commit<TAB>branch<TAB>what changed"
+# <task folder>/waits.tsv:    "time<TAB>waiting agent<TAB>waits for<TAB>what it needs<TAB>open|done"
+clean_text() { printf '%s' "$1" | tr '[:cntrl:]' ' ' | cut -c1-300; }   # one line, no terminal control codes
+one_role() { local r; r=$(check_roles "$1"); [[ "$r" != *" "* ]] || die "name one agent, not $1"; echo "$r"; }
+open_wait() { # <agent>: "waits for<TAB>what it needs" of its newest open wait, or nothing
+  awk -F'\t' -v w="$1" '$2 == w && $5 == "open" { line = $3 "\t" $4 } END { if (line != "") print line }' "$WT_ROOT/$TASK/waits.tsv" 2>/dev/null || true
+}
+agent_wait() { # <me> <other agent> <what I need>
+  local me on what
+  me=$(one_role "$1"); on=$(one_role "$2"); what=$(clean_text "$3")
+  [[ "$me" != "$on" ]] || die "an agent can't wait for itself"
+  [[ -n "${what// }" ]] || die "usage: $PROG wait $TASK <me> <agent> \"what you need from it\""
+  [[ -d "$WT_ROOT/$TASK" ]] || die "task $TASK has no folder"
+  lock_task || die "task $TASK is busy; try again"
+  printf '%s\t%s\t%s\t%s\topen\n' "$(date +%s)" "$me" "$on" "$what" >> "$WT_ROOT/$TASK/waits.tsv"
+  unlock_task
+  echo "recorded: $(agent_name "$me") waits for $(agent_name "$on"). It ends when $on runs: $PROG handoff $TASK $on $me \"...\""
+}
+handoff() { # <from> <to> <what changed>: points the other agent at a commit, ends its wait and tells it
+  local from to what wt sha br msg f="$WT_ROOT/$TASK/waits.tsv"
+  from=$(one_role "$1"); to=$(one_role "$2"); what=$(clean_text "$3")
+  [[ "$from" != "$to" ]] || die "an agent can't hand off to itself"
+  [[ -n "${what// }" ]] || die "usage: $PROG handoff $TASK <from> <to> \"what changed: exact names and shapes\""
+  wt=$(wt_dir "$from"); [[ -d "$wt" ]] || die "$(agent_name "$from") has no worktree in $TASK"
+  # a handoff points at a commit, so the other agent reads exactly what was handed over
+  [[ -z "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]] ||
+    die "commit first: $(agent_name "$from") has uncommitted changes in $wt"
+  sha=$(git -C "$wt" rev-parse --short HEAD); br=$(git -C "$wt" branch --show-current)
+  lock_task || die "task $TASK is busy; try again"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$from" "$to" "$sha" "${br:-detached}" "$what" >> "$WT_ROOT/$TASK/handoffs.tsv"
+  if [[ -f "$f" ]]; then
+    awk -F'\t' -v OFS='\t' -v w="$to" -v o="$from" '$2 == w && $3 == o && $5 == "open" { $5 = "done" } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
+  fi
+  unlock_task
+  msg="[handoff from $(agent_name "$from")] $what · commit $sha on branch ${br:-detached}, in $wt"
+  if is_running "$to" && [[ "$(agent_state "$to")" != needs-you ]]; then
+    tmux send-keys -t "$(agent_pane "$to")" -l -- "$msg"; sleep 0.3; tmux send-keys -t "$(agent_pane "$to")" Enter
+    echo "handed $sha to $(agent_name "$to"); the message is in its session"
+  else
+    echo "recorded $sha for $(agent_name "$to"). It isn't taking messages right now; it sees this with: $PROG inbox $TASK $to"
+  fi
+}
+inbox() { # <me>: what other agents handed me, and what I still wait for
+  local me w
+  me=$(one_role "$1")
+  awk -F'\t' -v m="$me" -v p="$PREFIX-" -v t="-$TASK" '$3 == m { n++; printf "handoff from %s%s%s: %s · commit %s on %s\n", p, $2, t, $6, $4, $5 }
+    END { if (!n) print "no handoffs to you yet" }' "$WT_ROOT/$TASK/handoffs.tsv" 2>/dev/null || echo "no handoffs to you yet"
+  w=$(open_wait "$me"); [[ -z "$w" ]] || echo "you still wait for $(agent_name "${w%%$TAB*}"): ${w#*$TAB}"
+  return 0
 }
 
 # ---- tmux helpers: agents are found by a pane tag (@agent <name>), wherever their pane sits ----
@@ -1324,11 +1380,11 @@ git_counts_cached() { # <worktree>: git_counts, reused for 15 seconds (the Monit
 MON_RATE=""
 monitor_lines() { # [raw]: one row per open task with its numbers, its agents indented below it; tasks that need you first
   # raw gives "state<TAB>agent<TAB>age<TAB>usd" per agent, for the header
-  local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop ch prs tusd ttok models a b br
+  local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop n_wait wt_on ch prs tusd ttok models a b br
   [[ "${1:-}" == raw ]] || MON_RATE=$(usd_rate)
   for s in $(open_sessions); do
     use_task "${s#"$PREFIX-"}"
-    trank=9; n_need=0; n_work=0; n_idle=0; n_stop=0; ch=0; prs=""; tusd=0; ttok=0; models=""
+    trank=9; n_need=0; n_work=0; n_idle=0; n_stop=0; n_wait=0; ch=0; prs=""; tusd=0; ttok=0; models=""
     for r in $(known_roles); do
       st=$(agent_state "$r"); kind=""; text=""; ts=""; age=""
       [[ "$st" == stopped ]] || IFS=$'\t' read -r kind text ts <<< "$(activity_of "$(wt_dir "$r")")"
@@ -1347,6 +1403,8 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
         crashed)   rank=1; n_stop=$((n_stop + 1)); text="${C_RED}stopped unexpectedly; start it from its actions${C_RESET}"; age="" ;;
         *)         rank=4; n_stop=$((n_stop + 1)); text=""; age="" ;;
       esac
+      wt_on=$(open_wait "$r")   # an idle agent that waits for another one shows what it waits for
+      if [[ -n "$wt_on" && "$st" == idle ]]; then n_wait=$((n_wait + 1)); text="${C_YELLOW}⧗ waiting for ${wt_on%%$TAB*}: ${wt_on#*$TAB}${C_RESET}"; fi
       [[ $rank -lt $trank ]] && trank=$rank
       info=""
       if [[ "${tk:-0}" -gt 0 ]]; then
@@ -1365,6 +1423,7 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
     [[ $n_need -gt 0 ]] && head+="${C_YELLOW}${C_BOLD}◆ $n_need $([[ $n_need -eq 1 ]] && echo needs || echo need) you${C_RESET}  "
     [[ $n_work -gt 0 ]] && head+="${C_GREEN}● $n_work working${C_RESET}  "
     [[ $n_idle -gt 0 ]] && head+="${C_CYAN}●${C_RESET} $n_idle idle  "
+    [[ $n_wait -gt 0 ]] && head+="${C_YELLOW}⧗ $n_wait waiting for an agent${C_RESET}  "
     [[ $n_stop -gt 0 ]] && head+="${C_DIM}○ $n_stop stopped${C_RESET}  "
     head+="${C_DIM}·${C_RESET} $(plural "$ch" "changed file")"
     [[ $ttok -gt 0 ]] && head+=" · $(tokens_short "$ttok") tokens · ${C_BOLD}$(money "$tusd" "$MON_RATE")${C_RESET} · ${C_DIM}$(model_list "$models")${C_RESET}"
@@ -2467,6 +2526,9 @@ main() {
     ls) list ;;
     repos) repos ;;
     add-repo) add_repo_cmd "$@" ;;
+    handoff)  check_task "${1:-}"; use_task "$1"; handoff "${2:-}" "${3:-}" "${*:4}" ;;
+    wait)     check_task "${1:-}"; use_task "$1"; agent_wait "${2:-}" "${3:-}" "${*:4}" ;;
+    inbox)    check_task "${1:-}"; use_task "$1"; inbox "${2:-}" ;;
     orgs)     owner_lines | while IFS=$'\t' read -r o d; do printf '%s %-24s %s\n' "$([[ "$o" == "$ORG" ]] && echo '*' || echo ' ')" "$o" "$d"; done ;;
     org)      if [[ -n "${1:-}" ]]; then use_org "$1"; remember_org; echo "commands now work in $ORG"; else need_org; echo "$ORG"; fi ;;
     _preview) preview "${1:-}" ;;
