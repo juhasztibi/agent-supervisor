@@ -248,6 +248,25 @@ out=$(AA_COLOR= "$A" _header); has "the overview lists it" "Closed unexpectedly"
 "$A" resume-all >/dev/null 2>&1
 wait_for 6 tmux has-session -t =tst-t1 && ok "resume-all opens it again" || bad "resume-all opens it again"
 
+section "Handoffs between agents"
+"$A" up t5 --only be,ui --goal x >/dev/null 2>&1
+wait_for 5 running t5 ui && wait_for 5 grep -q idle "$W/t5/ui.state"
+has "the role prompt says how to hand off" "ai-agents handoff t5 be <agent>" "$(cat "$W/t5/be.prompt.md")"
+out=$("$A" wait t5 ui be "the status field" 2>&1); has "an agent can say what it waits for" "waits for tst-be-t5" "$out"
+has "the monitor shows who waits for whom" "waiting for be: the status field" "$(AA_COLOR= "$A" _monitor)"
+echo x > "$W/t5/api/a.txt"; git -C "$W/t5/api" add a.txt
+out=$("$A" handoff t5 be ui "added status" 2>&1); has "a handoff needs committed work" "commit first" "$out"
+git -C "$W/t5/api" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -qm status
+sha=$(git -C "$W/t5/api" rev-parse --short HEAD)
+out=$("$A" handoff t5 be ui "added status: GET /x returns {status}" 2>&1); has "a handoff is delivered to a running agent" "handed $sha" "$out"
+sleep 0.5; has "the message names the commit" "handoff from tst-be-t5. added status: GET /x returns {status} · commit $sha" "$(tmux capture-pane -p -J -t "$(pane t5 ui)")"
+hasnt "the handoff ends the wait" "waiting for be" "$(AA_COLOR= "$A" _monitor)"
+has "the inbox lists it" "added status" "$("$A" inbox t5 ui)"
+"$A" stop t5 ui >/dev/null 2>&1
+out=$("$A" handoff t5 be ui "more" 2>&1); has "a handoff to a stopped agent waits in its inbox" "inbox t5 ui" "$out"
+out=$("$A" handoff t5 be be "x" 2>&1); has "an agent can't hand off to itself" "itself" "$out"
+"$A" down t5 --prune >/dev/null 2>&1
+
 section "Robustness"
 out=$(/bin/bash "$A" --org emptyorg repos 2>&1); hasnt "an organisation without agents works in bash 3.2" "unbound" "$out"
 out=$(/bin/bash "$A" --org emptyorg start t1 be 2>&1); has "and names the problem" "unknown agent 'be'" "$out"; hasnt "without a bash error" "unbound" "$out"
