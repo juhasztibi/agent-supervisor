@@ -77,7 +77,7 @@ done
 
 export PATH="$T/bin:$PATH" AA_WT_ROOT="$T/wt" AA_CONFIG_DIR="$T/cfg" XDG_CACHE_HOME="$T/cache" \
   AA_ORG=testorg AA_CLONE_ROOT="$T/clones" FAKE_REMOTES="$T/repos" AA_PREFIX=tst AA_OPEN=detached \
-  AA_REPO_ROOTS="$T/repos" AA_CLAUDE_PROJECTS="$T/projects" AA_CURRENCY=CHF AA_USD_RATE=0.8 AA_WATCH_SEC=1 AA_STUCK_SEC=3 AA_REMIND_SEC=3 \
+  AA_REPO_ROOTS="$T/repos" AA_CLAUDE_PROJECTS="$T/projects" AA_CURRENCY=CHF AA_USD_RATE=0.8 AA_WATCH_SEC=1 AA_STUCK_SEC=3 AA_REMIND_SEC=3 AA_NUDGE_SEC=2 AA_ANSWER_SEC=3 AA_WAIT_SEC=3 \
   FAKE_LOG="$T/fake.log" OSA_LOG="$T/osa.log"
 unset TMUX CLAUDECODE AA_ISSUE_REPO AA_BE_REPO AA_UI_REPO
 : > "$FAKE_LOG"; : > "$OSA_LOG"
@@ -248,23 +248,71 @@ out=$(AA_COLOR= "$A" _header); has "the overview lists it" "Closed unexpectedly"
 "$A" resume-all >/dev/null 2>&1
 wait_for 6 tmux has-session -t =tst-t1 && ok "resume-all opens it again" || bad "resume-all opens it again"
 
-section "Handoffs between agents"
-"$A" up t5 --only be,ui --goal x >/dev/null 2>&1
-wait_for 5 running t5 ui && wait_for 5 grep -q idle "$W/t5/ui.state"
-has "the role prompt says how to hand off" "ai-agents handoff t5 be <agent>" "$(cat "$W/t5/be.prompt.md")"
-out=$("$A" wait t5 ui be "the status field" 2>&1); has "an agent can say what it waits for" "waits for tst-be-t5" "$out"
-has "the monitor shows who waits for whom" "waiting for be: the status field" "$(AA_COLOR= "$A" _monitor)"
+section "Messages between agents"
+"$A" up t5 --only be,ui,ext --goal x >/dev/null 2>&1
+wait_for 5 running t5 ext && wait_for 5 grep -q idle "$W/t5/ext.state"; wait_for 5 grep -q idle "$W/t5/ui.state"
+as() { local who="$1"; shift; AA_TASK=t5 AA_AGENT="$who" "$A" "$@" 2>&1; }   # a command run from an agent's session
+hook() { echo "${3:-{\}}" | "$A" _hook t5 "$1" "$2"; }
+M="$W/t5/messages.tsv"; status() { awk -F'\t' -v i="$1" '$1 == i { print $9 }' "$M"; }
+has "the role prompt says how to hand off" "ai-agents handoff <agent|all>" "$(cat "$W/t5/be.prompt.md")"
+has "an agent command needs an agent session" "agent session" "$("$A" send ui hi 2>&1)"
+# an idle receiver: woken with one line, the message comes from its hook, once
+out=$(as be ask ui "which field holds the status?"); has "a question is queued" "#1 queued for tst-ui-t5" "$out"
+sleep 0.5; has "an idle agent is woken with one line, not the message" "You have new messages" "$(tmux capture-pane -p -J -t "$(pane t5 ui)")"
+hasnt "the message itself is never typed" "which field" "$(tmux capture-pane -p -J -t "$(pane t5 ui)")"
+out=$(hook ui UserPromptSubmit); has "its next prompt gets the message in its context" "additionalContext" "$out"
+has "with the question" "question from be: which field holds the status?" "$out"; has "and how to answer" "ai-agents reply 1" "$out"
+eq "it is marked delivered" "delivered" "$(status 1)"
+eq "and never delivered twice" "" "$(hook ui UserPromptSubmit)"
+hook ui Stop >/dev/null; has "the monitor shows the open question" "question from be" "$(AA_COLOR= "$A" _monitor)"
+out=$(as ui reply 1 "data.status"); has "a reply goes back to the asker" "queued for tst-be-t5" "$out"
+eq "the question counts as answered" "answered" "$(status 1)"
+# a working receiver: nothing typed, its next tool call delivers
+has "the asker's next prompt gets the answer" "answer from ui to your question" "$(hook be UserPromptSubmit)"
+nudges=$(tmux capture-pane -p -t "$(pane t5 be)" | grep -c "You have new messages")
+as ui send be "fyi" >/dev/null; sleep 0.5
+eq "a working agent is not interrupted" "$nudges" "$(tmux capture-pane -p -t "$(pane t5 be)" | grep -c "You have new messages")"
+has "its next tool call delivers the note" "note from ui: fyi" "$(hook be PostToolUse)"
+# a turn that ends with messages waiting continues with them
+as ext send be "one more" >/dev/null
+out=$(hook be Stop); has "the Stop hook makes it continue with new messages" '"decision": *"block"' "$out"; has "and names them" "note from ext: one more" "$out"
+# an agent asking you for permission: never touched, delivered after
+echo '{"tool_name":"Bash","tool_input":{"command":"git push"}}' | "$A" _hook t5 ext PermissionRequest
+id=$(as ui send ext "hello" | sed -E 's/^#([0-9]+).*/\1/'); sleep 0.5
+hasnt "an agent asking you something gets nothing typed" "You have new messages" "$(tmux capture-pane -p -t "$(pane t5 ext)")"
+eq "the message waits" "queued" "$(status "$id")"
+hook ext PostToolUse >/dev/null; eq "and arrives after your answer" "delivered" "$(status "$id")"
+# a stopped receiver gets it when it starts
+"$A" stop t5 ext >/dev/null 2>&1
+out=$(as be send ext "while you were away"); has "a stopped agent: the sender is told" "isn't running" "$out"
+id=$(sed -E 's/^#([0-9]+).*/\1/' <<< "$out"); "$A" start t5 ext >/dev/null 2>&1
+wait_for 5 bash -c "awk -F'\t' '\$1 == $id { print \$9 }' '$M' | grep -q delivered" && ok "its SessionStart hook delivers it" || bad "its SessionStart hook delivers it" "$(status "$id")"
+# waits and handoffs
+out=$(as ui wait be "the status field"); has "a wait goes to the other agent" "queued for tst-be-t5" "$out"
+hook ui Stop >/dev/null; has "the monitor shows who waits for whom" "waiting for be: the status field" "$(AA_COLOR= "$A" _monitor)"
 echo x > "$W/t5/api/a.txt"; git -C "$W/t5/api" add a.txt
-out=$("$A" handoff t5 be ui "added status" 2>&1); has "a handoff needs committed work" "commit first" "$out"
+has "a handoff needs committed work" "commit first" "$(as be handoff ui "added status")"
 git -C "$W/t5/api" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -qm status
 sha=$(git -C "$W/t5/api" rev-parse --short HEAD)
-out=$("$A" handoff t5 be ui "added status: GET /x returns {status}" 2>&1); has "a handoff is delivered to a running agent" "handed $sha" "$out"
-sleep 0.5; has "the message names the commit" "handoff from tst-be-t5. added status: GET /x returns {status} · commit $sha" "$(tmux capture-pane -p -J -t "$(pane t5 ui)")"
+as be handoff all "added status: GET /x returns {status}" >/dev/null
 hasnt "the handoff ends the wait" "waiting for be" "$(AA_COLOR= "$A" _monitor)"
-has "the inbox lists it" "added status" "$("$A" inbox t5 ui)"
-"$A" stop t5 ui >/dev/null 2>&1
-out=$("$A" handoff t5 be ui "more" 2>&1); has "a handoff to a stopped agent waits in its inbox" "inbox t5 ui" "$out"
-out=$("$A" handoff t5 be be "x" 2>&1); has "an agent can't hand off to itself" "itself" "$out"
+has "a handoff to all reaches every other agent" "2" "$(awk -F'\t' '$5 == "handoff"' "$M" | grep -c .)"
+has "the handoff names the commit" "handoff from be: added status: GET /x returns {status} (commit $sha on branch t5" "$(hook ui PostToolUse)"
+has "the inbox lists everything" "#1 question from be" "$(as ui inbox)"
+has "and what you still wait for" "asked, no answer yet" "$(as be ask ext "x"; as be inbox)"
+# the watchdog: nudges again, tells you about unanswered questions and long waits
+: > "$OSA_LOG"
+echo '{}' | "$A" _hook t5 ext Stop >/dev/null   # ext idle; the question to it stays unanswered
+hook ext PostToolUse >/dev/null
+wait_for 8 grep -q "hasn't answered" "$OSA_LOG" && ok "an unanswered question is reported" || bad "an unanswered question is reported" "$(cat "$OSA_LOG")"
+as ui wait ext "the config" >/dev/null; hook ext PostToolUse >/dev/null
+wait_for 8 grep -q "still waits for ext" "$OSA_LOG" && ok "a long wait is reported" || bad "a long wait is reported" "$(cat "$OSA_LOG")"
+# many agents at once: nothing lost, no duplicate ids
+before=$(grep -c . "$M")
+for who in be ui ext; do as "$who" send all "burst from $who" >/dev/null & done; wait
+eq "6 messages sent at once all arrive" "$((before + 6))" "$(grep -c . "$M")"
+eq "with unique ids" "$(grep -c . "$M")" "$(cut -f1 "$M" | sort -u | grep -c .)"
+eq "and every line is whole" "0" "$(awk -F'\t' 'NF != 13' "$M" | grep -c . || true)"
 "$A" down t5 --prune >/dev/null 2>&1
 
 section "Overlap between tasks"
@@ -274,7 +322,7 @@ git -C "$W/t8/api" -c user.email=t@t -c user.name=t -c commit.gpgsign=false comm
 echo b > "$W/t8/api/draft.txt"   # uncommitted work counts too
 edit() { printf '{"tool_name":"Edit","tool_input":{"file_path":"%s"}}' "$2" | "$A" _hook t9 be PreToolUse; }
 out=$(edit t9 "$W/t9/api/shared.txt"); has "editing a file another task changed is stopped" '"permissionDecision": *"deny"' "$out"
-has "and names the agent to talk to" "tst-be-t8" "$out"; has "and says how" "SendMessage" "$out"
+has "and names the agent to talk to" "tst-be-t8" "$out"; has "and says how" "ai-agents ask be@t8" "$out"
 eq "after agreeing, the same edit goes through" "" "$(edit t9 "$W/t9/api/shared.txt")"
 has "uncommitted work of another task counts too" "deny" "$(edit t9 "$(cd "$W/t9/api" && pwd -P)/draft.txt")"
 eq "a file nobody else changed is not stopped" "" "$(edit t9 "$W/t9/api/other.txt")"
