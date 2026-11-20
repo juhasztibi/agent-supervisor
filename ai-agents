@@ -80,6 +80,7 @@ set -euo pipefail
 
 PROG=ai-agents
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SELF_Q=$(printf %q "$SELF")   # for command strings that a shell, tmux or fzf parses again
 CONFIG_DIR="${AA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-agents}"
 REPO_ROOTS="${AA_REPO_ROOTS:-$HOME/Projects $HOME/code}"   # where local copies of repositories are looked for
 CLONE_ROOT="${AA_CLONE_ROOT:-$HOME/code}"                   # new clones go to <this>/<owner>/<repo>
@@ -300,16 +301,11 @@ saved_choice() { cat "$WT_ROOT/$TASK/$1.$2" 2>/dev/null || true; }   # <agent> <
 # needs-you, stopped (ended on purpose), crashed (ended unexpectedly and not restarted).
 HOOK_EVENTS="SessionStart UserPromptSubmit PreToolUse PostToolUse PermissionRequest Notification Stop StopFailure SessionEnd"
 hook_settings() { # <agent>: the --settings JSON with our hooks
-  local ev out="" cmd
-  for ev in $HOOK_EVENTS; do
-    cmd="AA_ORG=$ORG $SELF _hook $TASK $1 $ev"
-    case "$ev" in
-      PreToolUse|PostToolUse|PermissionRequest) out+="\"$ev\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"command\":\"$cmd\"}]}]," ;;
-      *) out+="\"$ev\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$cmd\"}]}]," ;;
-    esac
-  done
-  printf '{"hooks":{%s}}\n' "${out%,}"
+  jq -n --arg pre "AA_ORG=$ORG $SELF_Q _hook $TASK $1" --arg evs "$HOOK_EVENTS" '{hooks: ($evs | split(" ") | map({key: ., value: [
+    (if . == "PreToolUse" or . == "PostToolUse" or . == "PermissionRequest" then {matcher: "*"} else {} end)
+    + {hooks: [{type: "command", command: ($pre + " " + .)}]}]}) | from_entries)}'
 }
+
 state_file() { echo "$WT_ROOT/$TASK/$1.state"; }
 set_state() { # <agent> <state> <detail> [since]
   local f; f=$(state_file "$1")
@@ -1434,13 +1430,13 @@ feed() { # <socket> <seconds> <fzf action with @@> <command...>: runs the comman
 }
 live_feed() { # <seconds> <fzf action with @@> <command> [...]: sets LIVE to fzf arguments that feed it the command's output
   local sock="${NOTES:-${TMPDIR:-/tmp}/$PROG}.$$.$RANDOM.sock" cmd=""
-  while [[ $# -ge 3 ]]; do cmd+="$SELF _feed '$sock' $1 '$2' $SELF $3 >/dev/null 2>&1 & "; shift 3; done
+  while [[ $# -ge 3 ]]; do cmd+="$SELF_Q _feed '$sock' $1 '$2' $SELF_Q $3 >/dev/null 2>&1 & "; shift 3; done
   LIVE=(--listen="$sock" --bind "start:execute-silent:$cmd")
 }
 LIVE=()
 live() { # <seconds> <fzf action> [<seconds> <fzf action>]: sets LIVE to the fzf arguments that repeat them
   local sock="${NOTES:-${TMPDIR:-/tmp}/$PROG}.$$.$RANDOM.sock" cmd=""
-  while [[ $# -ge 2 ]]; do cmd+="$SELF _ticker '$sock' $1 '$2' >/dev/null 2>&1 & "; shift 2; done
+  while [[ $# -ge 2 ]]; do cmd+="$SELF_Q _ticker '$sock' $1 '$2' >/dev/null 2>&1 & "; shift 2; done
   LIVE=(--listen="$sock" --bind "start:execute-silent:$cmd")
 }
 
@@ -1871,7 +1867,7 @@ flow_running() {
     [[ "$lines" != "$BACK_LINE" ]] || { info "No open tasks. Start agents from the main menu."; return 0; }
     live_feed 3 "reload(@@)+refresh-preview" _agents
     sel=$(printf '%s\n' "$lines" | NO_BACK=1 pick "Running agents" "Live view on the right, updates every 3 seconds · Enter: actions · Type to search" \
-      --height=90% --track --id-nth=1 "${LIVE[@]}" --preview "[ {1} = $BACK ] || $SELF _preview {1}" \
+      --height=90% --track --id-nth=1 "${LIVE[@]}" --preview "[ {1} = $BACK ] || $SELF_Q _preview {1}" \
       --preview-window='right,60%,follow,border-left,<50(down,55%,follow,border-top)') || return 0
     task="${sel%%|*}"; role="${sel#*|}"
     agent_actions "$task" "$role" || return 0
@@ -1988,7 +1984,7 @@ flow_inventory() { # main menu: everything available, grouped by global, organis
   while :; do
     printf '%s' "$lines" | pick "Skills, plugins and MCP servers" \
       "$nplug plugins ($non on) · $nskill skills · $nmcp MCP servers · global, then organisation, then repositories · type global, org or repo to see one level · \"used\": by the open tasks' agents" \
-      --height=90% --preview "CLAUDE_ORG='$CLAUDE_ORG' $SELF _inv {1}" --preview-window='right,50%,wrap,border-left,<50(down,50%,wrap,border-top)' >/dev/null || return 0
+      --height=90% --preview "CLAUDE_ORG=$(printf %q "$CLAUDE_ORG") $SELF_Q _inv {1}" --preview-window='right,50%,wrap,border-left,<50(down,50%,wrap,border-top)' >/dev/null || return 0
   done
 }
 
@@ -2016,7 +2012,7 @@ agent_inventory() { # <task> <agent>: what this agent used, then what only its r
   while :; do
     printf '%s' "$lines" | pick "$(agent_name "$role"): skills, plugins and MCP servers" \
       "Used by this agent, most first, then what only its repo adds · global: your ~/.claude · org: your claude.ai organisation · repo: the repository · Type to search" \
-      --height=90% --preview "$SELF _inv {1}" --preview-window='right,50%,wrap,border-left,<50(down,50%,wrap,border-top)' >/dev/null || return 0
+      --height=90% --preview "$SELF_Q _inv {1}" --preview-window='right,50%,wrap,border-left,<50(down,50%,wrap,border-top)' >/dev/null || return 0
   done
 }
 
@@ -2068,7 +2064,7 @@ flow_monitor() { # all agents on one screen, refreshed every 3 seconds; Enter op
     live_feed 3 "reload(@@)" _monitor 10 "transform-header(@@)" _monitor_header
     sel=$(printf '%s\n' "$lines" | PICK_HEADER="${C_BOLD}Monitor${C_RESET}"$'\n'"${C_DIM}Loading…${C_RESET}" NO_BACK=1 pick "" "" \
       --height=100% --track --id-nth=1 "${LIVE[@]}" --bind '?:toggle-preview' \
-      --preview "case {1} in $BACK|__loading|*'|') echo 'Pick an agent to see its screen.' ;; *) $SELF _preview {1} ;; esac" \
+      --preview "case {1} in $BACK|__loading|*'|') echo 'Pick an agent to see its screen.' ;; *) $SELF_Q _preview {1} ;; esac" \
       --preview-window='right,50%,follow,hidden,border-left,<60(down,50%,follow,hidden,border-top)') || return 0
     [[ "$sel" == __loading ]] && continue
     if [[ "$sel" == *"|" ]]; then task_actions "${sel%|}"; else agent_actions "${sel%%|*}" "${sel#*|}" || true; fi
@@ -2079,7 +2075,7 @@ monitor_pane() { # <pane>: opens the monitor in a narrow pane on the right of th
   local target="${1:-}" p
   p=$(tmux list-panes -t "$target" -F '#{@monitor} #{pane_id}' 2>/dev/null | awk '$1 == "1" { print $2; exit }')
   if [[ -n "$p" ]]; then tmux kill-pane -t "$p"; return 0; fi
-  p=$(tmux split-window -h -l 40% -P -F '#{pane_id}' -t "$target" "$SELF monitor")
+  p=$(tmux split-window -h -l 40% -P -F '#{pane_id}' -t "$target" "$SELF_Q monitor")
   tmux set-option -p -t "$p" @monitor 1
 }
 
@@ -2419,11 +2415,11 @@ interactive() { # [monitor]
     if [[ -z "${AA_DASH:-}" || ! -s "$AA_DASH" ]]; then
       loading "Loading the overview of ${ORG}" "Agents, costs, pull requests and Docker"; main_header > /dev/null; loaded
     fi
-    live 10 "bg-transform-header($SELF _header)"
+    live 10 "bg-transform-header($SELF_Q _header)"
     choice=$(printf '%s\n' "start${TAB}1  Start new agents" "running${TAB}2  Running agents" \
       "resume${TAB}3  Resume agents" "repo${TAB}4  Add a repository" "remove${TAB}5  Remove agents" "tools${TAB}6  Skills, plugins and MCP servers" "monitor${TAB}7  Monitor: what every agent is doing" "org${TAB}8  Switch GitHub organisation" "quit${TAB}   Quit" |
       PICK_HEADER="$(main_header cached)" NO_BACK=1 pick "" "" --no-input "${LIVE[@]}" \
-        --bind "r:bg-transform-header($SELF _header)" --bind 'esc:ignore,q:abort,j:down,k:up,1:pos(1)+accept,2:pos(2)+accept,3:pos(3)+accept,4:pos(4)+accept,5:pos(5)+accept,6:pos(6)+accept,7:pos(7)+accept,m:pos(7)+accept,8:pos(8)+accept,o:pos(8)+accept') || break
+        --bind "r:bg-transform-header($SELF_Q _header)" --bind 'esc:ignore,q:abort,j:down,k:up,1:pos(1)+accept,2:pos(2)+accept,3:pos(3)+accept,4:pos(4)+accept,5:pos(5)+accept,6:pos(6)+accept,7:pos(7)+accept,m:pos(7)+accept,8:pos(8)+accept,o:pos(8)+accept') || break
     : > "$AA_SHOWN"
     case "$choice" in
       start)   flow_start ;;
