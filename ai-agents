@@ -200,7 +200,7 @@ load_repos() { # read the registry once; lookups below then need no extra proces
   R_KEYS=() R_PATHS=() R_DESCS=()
   while IFS=$'\t' read -r k p d; do R_KEYS+=("$k"); R_PATHS+=("$p"); R_DESCS+=("$d"); done < <(repo_lines)
 }
-all_roles() { echo "${R_KEYS[*]}"; }
+all_roles() { [[ ${#R_KEYS[@]} -eq 0 ]] || echo "${R_KEYS[*]}"; }
 repo_field() { # <agent> <1 name|2 path|3 description>
   local i
   for i in "${!R_KEYS[@]}"; do
@@ -238,6 +238,7 @@ known_roles() { # agents with a worktree or a pane in this task
 LAYOUT=""; ONLY=""; FRESH=""; GOAL=""; PRUNE=""; FORCE=""; OPEN=""; CREATED=""; FOCUS=""; MODELS=""; EFFORTS=""
 parse() {
   while [[ $# -gt 0 ]]; do
+    case "$1" in --only|--remote|--goal|--model|--effort|--agent) [[ $# -ge 2 ]] || die "$1 needs a value" ;; esac
     case "$1" in
       --split)       LAYOUT=split ;;
       --own)         LAYOUT=own ;;
@@ -694,7 +695,8 @@ end tell'
 
 up() {
   session_exists && die "$S is already running. Open it with: $PROG attach $TASK, or start an agent with: $PROG start $TASK <agent>"
-  local roles="${ONLY:-be ui}" r
+  local roles="$ONLY" r
+  [[ -n "$roles" ]] || die "name the agents to start: $PROG up $TASK --only a,b (agents: $(all_roles))"
   ensure_task "$roles" "${GOAL:-Wait for my instructions.}"
   save_choices "$roles"
   for r in $roles; do place "$r" "$LAYOUT"; launch "$r" fresh; done
@@ -907,7 +909,7 @@ remove() { # ROLES: stop the agents and delete their pane, shell, worktree and p
   fi
   for r in $ROLES; do
     stop_one "$r" >/dev/null
-    [[ "$r" == be ]] || { pkill -f -- "$(wt_dir "$r")/" 2>/dev/null && echo "$r: dev server processes stopped" || true; }
+    pkill -f -- "$(wt_dir "$r")/" 2>/dev/null && echo "$r: dev server processes stopped" || true
     if command -v docker >/dev/null; then
       for p in $(compose_projects_in "$(wt_dir "$r")"); do clean_project "$p"; echo "$r: docker project $p removed"; done
     fi
