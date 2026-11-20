@@ -904,7 +904,8 @@ docker_clean() { # <compose project> [folder]: that project, plus every project 
 
 down() {
   local r roles dirty; roles=$(known_roles)
-  if [[ -n "$PRUNE" ]]; then   # check every worktree first, so a refusal never leaves half a task behind
+  if [[ -n "$PRUNE" ]]; then   # stop the agents, then check every worktree, so a refusal never leaves half a task behind
+    for r in $roles; do is_running "$r" && stop_one "$r" >/dev/null; done
     dirty=$(dirty_roles "$roles")
     [[ -z "$dirty" ]] || die "not pruning $TASK: uncommitted changes in the worktree of: $dirty. Commit or stash them, or run down without --prune"
   fi
@@ -1101,8 +1102,9 @@ agent_usage() { # <worktree>: "<usd> <tokens> <replies without a price> <model> 
     c="$CACHE_DIR/usage/$(md5 -q -s "$f")"   # a transcript is read again only when it changed
     if [[ -f "$c" && "$(head -n 1 "$c")" == "$st" ]]; then line=$(sed -n 2p "$c")
     else
-      line=$(jq -rn --argjson P "$(prices_json)" "$JQ_USAGE" < "$f" 2>/dev/null || true)
-      printf '%s\n%s\n' "$st" "$line" > "$c"
+      if line=$(jq -rn --argjson P "$(prices_json)" "$JQ_USAGE" < "$f" 2>/dev/null); then
+        printf '%s\n%s\n' "$st" "$line" > "$c.$$" && mv "$c.$$" "$c"
+      else line=""; fi
     fi
     [[ -n "$line" ]] || continue
     IFS=$'\t' read -r u t k m e lt <<< "$line"
@@ -1223,10 +1225,11 @@ agent_tools() { # <worktree>: "kind<TAB>name<TAB>times" summed over all its sess
   while IFS= read -r f; do
     st=$(stat -f '%m:%z' "$f" 2>/dev/null) || continue
     c="$CACHE_DIR/tools/$(md5 -q -s "$f")"
-    if [[ ! -f "$c" || "$(head -n 1 "$c")" != "$st" ]]; then
-      { echo "$st"; jq -rn "$JQ_TOOLS" < "$f" 2>/dev/null || true; } > "$c"
+    if [[ -f "$c" && "$(head -n 1 "$c")" == "$st" ]]; then tail -n +2 "$c"
+    elif out=$(jq -rn "$JQ_TOOLS" < "$f" 2>/dev/null); then
+      { echo "$st"; [[ -z "$out" ]] || printf '%s\n' "$out"; } > "$c.$$" && mv "$c.$$" "$c"
+      [[ -z "$out" ]] || printf '%s\n' "$out"
     fi
-    tail -n +2 "$c"
   done < <(find "$pdir" -name '*.jsonl' -type f 2>/dev/null) |
     awk -F'\t' 'NF == 3 { n[$1 FS $2] += $3 } END { for (k in n) print k FS n[k] }' | sort -t$'\t' -k3,3nr
 }
