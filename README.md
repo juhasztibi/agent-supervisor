@@ -14,7 +14,22 @@
 
 ## Install
 
-Needs macOS, [Claude Code](https://claude.com/claude-code), `tmux`, `fzf` (recent; tested with 0.75), `jq`, `git` and the GitHub CLI `gh` (logged in). iTerm2 is optional.
+Needs macOS and these tools, at least the version shown. Each minimum is the release that added the newest feature `ai-agents` uses.
+
+| Tool | Minimum | Why that version | Tested with |
+|---|---|---|---|
+| [Claude Code](https://claude.com/claude-code) | 2.1.287 | `asyncRewake` hooks wake idle agents (also needs `--name` 2.1.76, `StopFailure` 2.1.78) | 2.1.330 |
+| tmux | 3.2 | `new-session -e`; also the `prefix + a` popup | 3.8 |
+| fzf | 0.71.0 | `--track --id-nth` keeps the cursor on the same row while lists refresh | 0.75.0 |
+| GitHub CLI `gh`, logged in | 2.7.0 | `gh search issues --owner` for the issue picker | 2.96.0 |
+| git | 2.22 | `git branch --show-current` | 2.50.1 |
+| jq | 1.5 | `--slurpfile`, `@tsv`, regex functions | 1.8.2 |
+| bash | 3.2 | the one macOS ships at `/bin/bash` | 3.2.57 |
+| curl | 7.40 | `--unix-socket` for live refresh | 8.7.1 |
+
+Also used, all part of macOS: `osascript` (notifications), `perl`, `md5`. Tested on macOS 26.7. iTerm2 and Docker are optional.
+
+Claude Code 2.1.287 is a safe minimum, not an exact one: `asyncRewake` exists there, but its changelog doesn't say when it was added.
 
 ```sh
 brew install tmux fzf jq gh
