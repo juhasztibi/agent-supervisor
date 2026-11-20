@@ -59,6 +59,8 @@ Agents talk only through `ai-agents`, so every message is stored, delivered and 
 
 Nothing is ever typed into an agent's pane: each pane runs Claude Code directly. Claude Code hooks add new messages to its context at its next step, and a turn that ends with messages waiting continues with them. An idle agent is woken by a background listener (an `asyncRewake` hook) with the messages themselves. A stopped agent gets its messages when it starts. Your own `ai-agents say` messages travel the same way. The watchdog tells you about messages it can't deliver, questions unanswered for 15 minutes and waits longer than 30 minutes (`AA_ANSWER_SEC`, `AA_WAIT_SEC`).
 
+**Trust model.** All agents run as your user, so an agent with free shell access can do anything you can, including writing the message files or posing as you. The message system keeps honest agents and agents misled by text (an issue body, another agent's message) apart from your instructions: other agents' words always arrive quoted, and `say` refuses to run from an agent. The real boundary is Claude Code's permission settings, so don't give agents unrestricted shell access.
+
 When an agent is about to edit a file that an agent of another task already changed in the same repo, the first edit is stopped and it is told to ask that agent (`ai-agents ask be@t1 "..."`) and agree who does it. Once they agree, the same edit goes through. The Monitor shows "⚠ overlap with <task>".
 
 ## Commands
