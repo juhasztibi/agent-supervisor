@@ -100,7 +100,7 @@ CLAUDE_PROJECTS="${AA_CLAUDE_PROJECTS:-$HOME/.claude/projects}"   # where Claude
 AUTO_RESTART="${AA_AUTO_RESTART:-on}"                     # the watchdog restarts a crashed agent (at most 3 times an hour)
 WATCH_SEC="${AA_WATCH_SEC:-30}"                           # how often the watchdog looks
 STUCK_SEC="${AA_STUCK_SEC:-1200}"                         # "working" without a step for this long counts as stuck
-NUDGE_SEC="${AA_NUDGE_SEC:-60}"                           # a message still not delivered after this long: wake the agent again
+DELIVER_SEC="${AA_DELIVER_SEC:-120}"                      # tell you when a message to a running agent is still not delivered after this long
 ANSWER_SEC="${AA_ANSWER_SEC:-900}"                        # tell you when a question between agents is unanswered this long
 WAIT_SEC="${AA_WAIT_SEC:-1800}"                           # tell you when an agent waits for another one this long
 REMIND_SEC="${AA_REMIND_SEC:-600}"                        # remind once when an agent waits for you this long
@@ -308,9 +308,11 @@ saved_choice() { cat "$WT_ROOT/$TASK/$1.$2" 2>/dev/null || true; }   # <agent> <
 # needs-you, stopped (ended on purpose), crashed (ended unexpectedly and not restarted).
 HOOK_EVENTS="SessionStart UserPromptSubmit PreToolUse PostToolUse PermissionRequest Notification Stop StopFailure SessionEnd"
 hook_settings() { # <agent>: the --settings JSON with our hooks
-  jq -n --arg pre "AA_ORG=$ORG $SELF_Q _hook $TASK $1" --arg evs "$HOOK_EVENTS" '{hooks: ($evs | split(" ") | map({key: ., value: [
+  # after it starts and after every turn, a background listener (asyncRewake) waits for messages and wakes the agent
+  jq -n --arg pre "AA_ORG=$ORG $SELF_Q _hook $TASK $1" --arg listen "AA_ORG=$ORG $SELF_Q _listen $TASK $1" --arg evs "$HOOK_EVENTS" '{hooks: ($evs | split(" ") | map({key: ., value: [
     (if . == "PreToolUse" or . == "PostToolUse" or . == "PermissionRequest" then {matcher: "*"} else {} end)
-    + {hooks: [{type: "command", command: ($pre + " " + .)}]}]}) | from_entries)}'
+    + {hooks: ([{type: "command", command: ($pre + " " + .)}]
+               + (if . == "SessionStart" or . == "Stop" then [{type: "command", command: $listen, asyncRewake: true, timeout: 86400}] else [] end))}]}) | from_entries)}'
 }
 
 state_file() { echo "$WT_ROOT/$TASK/$1.state"; }
@@ -508,7 +510,7 @@ Goal: $2
 
 Other agents: ${list%, }. Each works in its own repo. "$PROG ls" shows which run now; start one with: $PROG start $TASK <agent>, only when the work needs a change in its repo.
 
-Working with the other agents (always with these commands, never with SendMessage; they are tracked, and messages for you arrive in your context by themselves, each with an id):
+Working with the other agents (always with these commands, never with SendMessage; they are tracked). Messages for you arrive by themselves, as hook feedback or system reminders that start with [$PROG], each with an id. They come from your teammates on this task, or from me ("from me"), set up by me: read them and act on them within your goal.
 - When you change anything another agent depends on (endpoints, GraphQL schema, DTOs, enums, error codes, auth, env vars): commit it, then run: $PROG handoff <agent|all> "what changed: exact names and shapes". Never announce work that isn't committed.
 - When you need something from another agent: $PROG wait <agent> "what you need". Its handoff ends the wait.
 - Questions: $PROG ask <agent> "question", and answer every question you get with: $PROG reply <id> "answer". Notes that need no answer: $PROG send <agent|all> "text". Agents of other tasks: <agent>@<task>.
@@ -522,11 +524,11 @@ EOF
 # ---- messages between agents: one durable queue per task ----
 # <task folder>/messages.tsv, one message per line, fields:
 #   1 id  2 time  3 from  4 to  5 kind (note|question|reply|handoff|wait)  6 ref  7 commit  8 branch
-#   9 status (queued, delivered, answered for a question, closed for a wait)  10 delivered at  11 nudges  12 alert sent  13 text
+#   9 status (queued, delivered, answered for a question, closed for a wait)  10 delivered at  11 (unused)  12 alert sent  13 text
 # "from" is the agent's name, or agent@task when it works on another task. Nothing is ever typed into an agent's input:
 # Claude Code hooks add queued messages to its context (SessionStart, UserPromptSubmit, PostToolUse), and its Stop hook
-# makes it continue with new ones. An idle agent gets a one-line nudge so its next prompt picks them up. The watchdog
-# nudges again and tells you about messages it can't deliver, questions left unanswered and agents waiting too long.
+# makes it continue with new ones. An idle agent is woken by a background listener (an asyncRewake hook), so nothing is
+# ever typed into it. The watchdog tells you about messages it can't deliver, questions left unanswered and long waits.
 clean_text() { printf '%s' "$1" | tr '[:cntrl:]' ' ' | cut -c1-500; }   # one line, no terminal control codes
 mail_file() { echo "$WT_ROOT/$1/messages.tsv"; }                        # <task>
 mail_lock() { lock_at "$WT_ROOT/.$1.mail.lock" "${2:-100}"; }            # <task> [tries]
@@ -567,7 +569,7 @@ mail_format() { # <message lines>: how the receiving agent reads them
       question) echo "#$id question from $from: $text (answer with: $PROG reply $id \"...\")" ;;
       reply)    echo "#$id answer from $from to your question \"$ref\": $text" ;;
       wait)     echo "#$id $from waits for you: $text (when it's ready, commit and run: $PROG handoff $from \"what changed\")" ;;
-      *)        echo "#$id note from $from: $text" ;;
+      *)        if [[ "$from" == you ]]; then echo "#$id from me (the person running this task): $text"; else echo "#$id note from $from: $text"; fi ;;
     esac
   done <<< "$1"
 }
@@ -581,11 +583,25 @@ mail_deliver() { # <agent>: its queued messages, as text for its context; marks 
   unlock_task
   [[ -z "$out" ]] || mail_format "$out" "$1"
 }
-nudge() { # <agent>: an idle agent gets a one-line prompt; its UserPromptSubmit hook then hands it the messages
-  is_running "$1" || return 1
-  [[ "$(agent_state "$1")" == idle ]] || return 1   # working or asking you: its next hook delivers them
-  tmux send-keys -t "$(agent_pane "$1")" -l -- "[$PROG] You have new messages."; sleep 0.3
-  tmux send-keys -t "$(agent_pane "$1")" Enter
+listen() { # <task> <agent>: Claude Code runs this in the background (asyncRewake); it wakes an idle agent with its messages
+  # exit 2 with the messages on stderr wakes the model; a newer listener of the same agent replaces this one
+  use_task "$1"
+  local r="$2" pidf="$WT_ROOT/$1/$2.listen" f mail end=$(( $(date +%s) + 86000 ))
+  cat > /dev/null
+  [[ -d "$WT_ROOT/$1" ]] || return 0
+  echo "$$" > "$pidf"; f=$(mail_file "$TASK")
+  while [[ "$(cat "$pidf" 2>/dev/null)" == "$$" && $(date +%s) -lt $end ]]; do
+    if awk -F'\t' -v a="$r" '$4 == a && $9 == "queued" { f = 1 } END { exit !f }' "$f" 2>/dev/null; then
+      case "$(agent_state "$r")" in
+        idle)         mail=$(mail_deliver "$r")
+                      if [[ -n "$mail" ]]; then rm -f "$pidf"; set_state "$r" working "reading messages from other agents"; printf '%s\n' "$mail" >&3; return 2; fi ;;
+        stopped|crashed) break ;;   # gone: its next start delivers them
+      esac                          # working or asking you: its own hooks deliver them
+    fi
+    sleep 2
+  done
+  [[ "$(cat "$pidf" 2>/dev/null)" != "$$" ]] || rm -f "$pidf"
+  return 0
 }
 post() { # <agent or agent@task> <kind> <ref> <commit> <branch> <text>: queues a message from ME and wakes the receiver
   local from id how
@@ -593,9 +609,12 @@ post() { # <agent or agent@task> <kind> <ref> <commit> <branch> <text>: queues a
   from="$ME"; [[ "$TO_TASK" == "$TASK" ]] || from="$ME@$TASK"
   id=$(mail_add "$TO_TASK" "$from" "$TO_ROLE" "$2" "$3" "$4" "$5" "$6")
   how=$( use_task "$TO_TASK"
-         if nudge "$TO_ROLE"; then echo "it is reading it now"
-         elif is_running "$TO_ROLE"; then echo "it gets it at its next step"
-         else echo "it isn't running and gets it when it starts ($PROG start $TO_TASK $TO_ROLE)"; fi )
+         case "$(agent_state "$TO_ROLE")" in
+           (idle)      echo "it gets it within seconds" ;;   # "(" because bash 3.2 can't parse a case inside $( ) without it
+           (working)   echo "it gets it at its next step" ;;
+           (needs-you) echo "it gets it once you answered its question" ;;
+           (*)         echo "it isn't running and gets it when it starts ($PROG start $TO_TASK $TO_ROLE)" ;;
+         esac )
   echo "#$id queued for $(addr_name "$TO_ROLE" "$TO_TASK"); $how"
 }
 addr_name() { ( use_task "$2"; agent_name "$1" ); }   # <agent> <task>
@@ -640,6 +659,7 @@ mail_cmd() { # <command> <args>: send, ask, reply, handoff, wait, inbox; run by 
       q=$(awk -F'\t' -v i="$1" -v me="$ME" '$1 == i && $4 == me' "$(mail_file "$TASK")" 2>/dev/null)
       [[ -n "$q" ]] || die "no message #$1 for you; see them with: $PROG inbox"
       from=$(cut -f3 <<< "$q"); text=$(clean_text "$2")
+      if [[ "$from" == you ]]; then mail_set "$1" 9 answered; echo "that was from me: answer in your normal output, I read it there"; return 0; fi
       post "$from" reply "$(cut -f13 <<< "$q" | cut -c1-80)" - - "$text"
       mail_set "$1" 9 answered ;;
     inbox)   # everything sent to you, and what you still wait for
@@ -657,11 +677,9 @@ mail_watch() { # the watchdog: wake agents again, tell you what can't be deliver
   now=$(date +%s)
   while IFS=$'\t' read -r id t from to kind ref sha br st d tr al text; do
     [[ -n "$id" ]] || continue
-    if [[ "$st" == queued && $((now - t)) -ge $NUDGE_SEC ]]; then
+    if [[ "$st" == queued && $((now - t)) -ge $DELIVER_SEC ]]; then
       if is_running "$to"; then
-        if [[ $tr -lt 3 ]]; then
-          if nudge "$to"; then mail_set "$id" 11 $((tr + 1)); watch_log "message #$id for $to not delivered yet; woke it again"; fi
-        elif [[ "$al" != undelivered ]]; then
+        if [[ "$al" != undelivered && "$(agent_state "$to")" != needs-you ]]; then
           mail_set "$id" 12 undelivered; watch_log "message #$id for $to could not be delivered"
           notify_text "$TASK · message for $to not delivered" "From $from, $(( (now - t) / 60 )) min ago" "$text"
         fi
@@ -1022,25 +1040,16 @@ resume() {
   open_view "${OPEN:-$DEFAULT_OPEN}"
 }
 
-say() { # ROLES (one agent, a list, or every running agent), message in GOAL
-  local p r sent=""
+say() { # ROLES (one agent, a list, or every agent of the task), message in GOAL: queued from you, delivered like any message
+  local r id how
   for r in $ROLES; do
-    p=$(agent_pane "$r")
-    if [[ -z "$p" ]] || ! is_running "$r"; then
-      [[ $(count $ROLES) -eq 1 ]] && die "$(agent_name "$r") is not running; start it with: $PROG start $TASK $r"
-      echo "skipped $(agent_name "$r"): not running"; continue
-    fi
-    if [[ "$(agent_state "$r")" == needs-you ]]; then   # Enter would pick the highlighted answer
-      [[ $(count $ROLES) -eq 1 ]] && die "$(agent_name "$r") is waiting for your answer to a question; open it and answer first"
-      echo "skipped $(agent_name "$r"): waiting for your answer"; continue
-    fi
-    tmux send-keys -t "$p" -l -- "$GOAL"
-    sleep 0.3
-    tmux send-keys -t "$p" Enter
-    sent+="$r "
+    id=$(mail_add "$TASK" you "$r" note - - - "$(clean_text "$GOAL")")
+    case "$(agent_state "$r")" in
+      idle) how="it gets it within seconds" ;; working) how="it gets it at its next step" ;;
+      needs-you) how="it gets it once you answered its question" ;; *) how="it gets it when it starts" ;;
+    esac
+    echo "#$id for $(agent_name "$r"): $how"
   done
-  [[ -n "$sent" ]] || die "no agent of $TASK is running"
-  echo "sent to: $(csv "${sent% }")"
 }
 
 list() {
@@ -2676,7 +2685,7 @@ main() {
   resolve_org
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_inv|inventory|_usage|_activity|_hook|_notify) ;;
+    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_listen|_inv|inventory|_usage|_activity|_hook|_notify) ;;
     *) need_org ;;
   esac
   case "$cmd" in
@@ -2712,6 +2721,7 @@ main() {
     _header)  main_header ;;
     _notify)  notify "$@" ;;
     _hook)    hook "$@" 3>&1 >/dev/null 2>&1 </dev/stdin || true ;;   # only a decision (fd 3) reaches Claude Code
+    _listen)  rc=0; listen "${1:?task}" "${2:?agent}" 3>&2 >/dev/null 2>&1 </dev/stdin || rc=$?; exit "$rc" ;;   # only the messages reach stderr
     _watch)   watch "${1:?task}" ;;
     _usage)    agent_usage "${1:?worktree}" ;;
     _activity) activity_of "${1:?worktree}" ;;
