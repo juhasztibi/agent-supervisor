@@ -267,6 +267,21 @@ out=$("$A" handoff t5 be ui "more" 2>&1); has "a handoff to a stopped agent wait
 out=$("$A" handoff t5 be be "x" 2>&1); has "an agent can't hand off to itself" "itself" "$out"
 "$A" down t5 --prune >/dev/null 2>&1
 
+section "Overlap between tasks"
+"$A" up t8 --only be --goal x >/dev/null 2>&1; "$A" up t9 --only be --goal y >/dev/null 2>&1
+echo a > "$W/t8/api/shared.txt"; git -C "$W/t8/api" add shared.txt
+git -C "$W/t8/api" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -qm shared
+echo b > "$W/t8/api/draft.txt"   # uncommitted work counts too
+edit() { printf '{"tool_name":"Edit","tool_input":{"file_path":"%s"}}' "$2" | "$A" _hook t9 be PreToolUse; }
+out=$(edit t9 "$W/t9/api/shared.txt"); has "editing a file another task changed is stopped" '"permissionDecision": *"deny"' "$out"
+has "and names the agent to talk to" "tst-be-t8" "$out"; has "and says how" "SendMessage" "$out"
+eq "after agreeing, the same edit goes through" "" "$(edit t9 "$W/t9/api/shared.txt")"
+has "uncommitted work of another task counts too" "deny" "$(edit t9 "$(cd "$W/t9/api" && pwd -P)/draft.txt")"
+eq "a file nobody else changed is not stopped" "" "$(edit t9 "$W/t9/api/other.txt")"
+has "the monitor shows the overlap" "overlap with t8" "$(AA_COLOR= "$A" _monitor)"
+"$A" down t8 >/dev/null 2>&1; "$A" down t9 >/dev/null 2>&1
+rm -rf "$W/t8/api/draft.txt"; "$A" down t8 --prune >/dev/null 2>&1; "$A" down t9 --prune >/dev/null 2>&1
+
 section "Robustness"
 out=$(/bin/bash "$A" --org emptyorg repos 2>&1); hasnt "an organisation without agents works in bash 3.2" "unbound" "$out"
 out=$(/bin/bash "$A" --org emptyorg start t1 be 2>&1); has "and names the problem" "unknown agent 'be'" "$out"; hasnt "without a bash error" "unbound" "$out"
@@ -308,6 +323,7 @@ rmdir "$W/.t2.lock"; wait; wait_for 5 grep -q '^args: .*--name tst-ui-t2' "$FAKE
 eq "and runs once the task is free" "1" "$(grep -c '^args: .*--name tst-ui-t2' "$FAKE_LOG")"
 "$A" stop t2 ui >/dev/null 2>&1; : > "$FAKE_LOG"
 "$A" start t2 ui >/dev/null 2>&1 & "$A" start t2 ui >/dev/null 2>&1 & wait
+wait_for 5 grep -q '^args: .*--name tst-ui-t2' "$FAKE_LOG"; sleep 1   # the fake claude logs a moment after start returns
 "$A" start t2 ext >/dev/null 2>&1 & "$A" start t2 ext >/dev/null 2>&1 & wait
 sleep 1   # the fake claude logs a moment after start returns
 eq "two starts at once launch it once" "1" "$(grep -c '^args: .*--name tst-ui-t2' "$FAKE_LOG")"
