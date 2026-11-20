@@ -77,7 +77,7 @@ done
 
 export PATH="$T/bin:$PATH" AA_WT_ROOT="$T/wt" AA_CONFIG_DIR="$T/cfg" XDG_CACHE_HOME="$T/cache" \
   AA_ORG=testorg AA_CLONE_ROOT="$T/clones" FAKE_REMOTES="$T/repos" AA_PREFIX=tst AA_OPEN=detached \
-  AA_REPO_ROOTS="$T/repos" AA_CLAUDE_PROJECTS="$T/projects" AA_CURRENCY=CHF AA_USD_RATE=0.8 AA_WATCH_SEC=1 AA_STUCK_SEC=3 AA_REMIND_SEC=3 AA_NUDGE_SEC=2 AA_ANSWER_SEC=3 AA_WAIT_SEC=3 \
+  AA_REPO_ROOTS="$T/repos" AA_CLAUDE_PROJECTS="$T/projects" AA_CURRENCY=CHF AA_USD_RATE=0.8 AA_WATCH_SEC=1 AA_STUCK_SEC=3 AA_REMIND_SEC=3 AA_DELIVER_SEC=2 AA_ANSWER_SEC=3 AA_WAIT_SEC=3 \
   FAKE_LOG="$T/fake.log" OSA_LOG="$T/osa.log"
 unset TMUX CLAUDECODE AA_ISSUE_REPO AA_BE_REPO AA_UI_REPO
 : > "$FAKE_LOG"; : > "$OSA_LOG"
@@ -133,6 +133,9 @@ s=$(cat "$W/t1/be.settings.json")
 for ev in SessionStart UserPromptSubmit PreToolUse PostToolUse PermissionRequest Notification Stop StopFailure SessionEnd; do
   has "settings hook $ev" "\"$ev\"" "$s"
 done
+eq "a background listener wakes it after it starts and after every turn" "SessionStart Stop" "$(jq -r '[.hooks | to_entries[] | select(any(.value[].hooks[]; .asyncRewake == true)) | .key] | join(" ")' <<< "$s")"
+has "Claude Code is the pane's own command" "claude --name tst-be-t1" "$(tmux display -p -t "$(pane t1 be)" '#{pane_start_command}')"
+hasnt "nothing was typed into the pane" "unset CLAUDECODE" "$(tmux capture-pane -p -t "$(pane t1 be)")"
 has "hooks know the organisation" "AA_ORG=testorg " "$s"
 wait_for 5 grep -q idle "$W/t1/be.state" && ok "SessionStart makes it idle" || bad "SessionStart makes it idle" "$(cat "$W/t1/be.state" 2>/dev/null)"
 echo '{}' | "$A" _hook t1 be UserPromptSubmit; eq "a prompt makes it working" "working" "$(state t1 be)"
@@ -175,8 +178,9 @@ out=$("$A" ls); has "ls keeps its format" "^t1  be: running in window" "$out"
 section "Messages"
 "$A" say t1 all "hello agents" >/dev/null
 sleep 0.5
-has "say all reaches be" "hello agents" "$(tmux capture-pane -p -t "$(pane t1 be)")"
-has "say all reaches ext" "hello agents" "$(tmux capture-pane -p -t "$(pane t1 ext)")"
+hasnt "say types nothing into the agent" "hello agents" "$(tmux capture-pane -p -t "$(pane t1 be)")"
+has "say reaches be through its hooks, from you" "from me (the person running this task): hello agents" "$(echo '{}' | "$A" _hook t1 be PostToolUse)"
+has "and ext" "hello agents" "$(echo '{}' | "$A" _hook t1 ext PostToolUse)"
 
 section "Stop, restart, resume"
 "$A" stop t1 ext >/dev/null
@@ -258,7 +262,7 @@ has "the role prompt says how to hand off" "ai-agents handoff <agent|all>" "$(ca
 has "an agent command needs an agent session" "agent session" "$("$A" send ui hi 2>&1)"
 # an idle receiver: woken with one line, the message comes from its hook, once
 out=$(as be ask ui "which field holds the status?"); has "a question is queued" "#1 queued for tst-ui-t5" "$out"
-sleep 0.5; has "an idle agent is woken with one line, not the message" "You have new messages" "$(tmux capture-pane -p -J -t "$(pane t5 ui)")"
+sleep 0.5; hasnt "nothing is typed into the receiver" "You have new messages" "$(tmux capture-pane -p -J -t "$(pane t5 ui)")"
 hasnt "the message itself is never typed" "which field" "$(tmux capture-pane -p -J -t "$(pane t5 ui)")"
 out=$(hook ui UserPromptSubmit); has "its next prompt gets the message in its context" "additionalContext" "$out"
 has "with the question" "question from be: which field holds the status?" "$out"; has "and how to answer" "ai-agents reply 1" "$out"
@@ -307,6 +311,24 @@ hook ext PostToolUse >/dev/null
 wait_for 8 grep -q "hasn't answered" "$OSA_LOG" && ok "an unanswered question is reported" || bad "an unanswered question is reported" "$(cat "$OSA_LOG")"
 as ui wait ext "the config" >/dev/null; hook ext PostToolUse >/dev/null
 wait_for 8 grep -q "still waits for ext" "$OSA_LOG" && ok "a long wait is reported" || bad "a long wait is reported" "$(cat "$OSA_LOG")"
+# the background listener wakes an idle agent with its messages, without typing
+listen() { ( "$A" _listen t5 "$1" < /dev/null 2> "$T/listen.$2.err"; echo $? > "$T/listen.$2.rc" ) & }
+hook ui Stop >/dev/null; rm -f "$T"/listen.*
+listen ui a; sleep 1
+id=$(as be send ui "wake up, the API is ready" | sed -E 's/^#([0-9]+).*/\1/')
+wait_for 6 test -f "$T/listen.a.rc" && ok "the listener wakes an idle agent" || bad "the listener wakes an idle agent"
+eq "with exit code 2 (asyncRewake)" "2" "$(cat "$T/listen.a.rc" 2>/dev/null)"
+has "and the message itself" "note from be: wake up, the API is ready" "$(cat "$T/listen.a.err")"
+eq "the message counts as delivered" "delivered" "$(status "$id")"
+listen ui b; sleep 1; listen ui c; wait_for 5 test -f "$T/listen.b.rc" && ok "a newer listener replaces the older one" || bad "a newer listener replaces the older one"
+eq "the replaced one ends quietly" "0" "$(cat "$T/listen.b.rc" 2>/dev/null)"
+hook ui UserPromptSubmit >/dev/null   # ui works now
+id=$(as be send ui "while you work" | sed -E 's/^#([0-9]+).*/\1/'); sleep 3
+check "the listener leaves a working agent alone" test ! -f "$T/listen.c.rc"
+eq "its next step gets the message instead" "delivered" "$(hook ui PostToolUse >/dev/null; status "$id")"
+pkill -f "_listen t5 ui" 2>/dev/null
+: > "$OSA_LOG"; hook ext Stop >/dev/null; as be send ext "nobody listens" >/dev/null
+wait_for 8 grep -q "not delivered" "$OSA_LOG" && ok "a message no listener picks up is reported" || bad "a message no listener picks up is reported" "$(cat "$OSA_LOG")"
 # many agents at once: nothing lost, no duplicate ids
 before=$(grep -c . "$M")
 for who in be ui ext; do as "$who" send all "burst from $who" >/dev/null & done; wait
@@ -360,7 +382,8 @@ kill "$foreign" 2>/dev/null
 # say must not answer a permission prompt
 wait_for 5 running t2 ui
 echo '{"tool_name":"Bash","tool_input":{"command":"git push"}}' | "$A" _hook t2 ui PermissionRequest
-out=$("$A" say t2 ui "1" 2>&1); has "say refuses an agent that waits for your answer" "waiting for your answer" "$out"
+out=$("$A" say t2 ui "1" 2>&1); has "say to an agent asking you something waits for your answer" "once you answered" "$out"
+hasnt "and types nothing into its permission prompt" "^1$" "$(tmux capture-pane -p -t "$(pane t2 ui)")"
 echo '{}' | "$A" _hook t2 ui Stop
 
 # two starts of the same agent at once (agents run start themselves)
