@@ -23,6 +23,13 @@ ln -s ~/Projects/agent-supervisor/ai-agents ~/.local/bin/ai-agents   # any folde
 ai-agents selftest                                                   # about 30 seconds, touches nothing of yours
 ```
 
+Let the agents run the commands they use to work together, without asking you each time (`~/.claude/settings.json`, under `permissions.allow`):
+
+```json
+"Bash(ai-agents ls)", "Bash(ai-agents start *)", "Bash(ai-agents stop *)",
+"Bash(ai-agents handoff *)", "Bash(ai-agents wait *)", "Bash(ai-agents inbox *)"
+```
+
 Optional tmux keys (add to `~/.tmux.conf`):
 
 ```tmux
@@ -40,6 +47,10 @@ bind O run-shell "~/.local/bin/ai-agents monitor-pane '#{pane_id}'"             
 6. **Done:** `5 Remove agents` stops them and deletes worktrees, panes and the task's Docker containers. Branches stay.
 
 Keys in every screen: Enter chooses, Esc or `← Back` goes back, type to search. On the overview: `1`-`8` jump, `m` monitor, `o` switch organisation, `r` refresh, `q` quit.
+
+## How agents hand work to each other
+
+An agent that changes something another agent depends on commits it, then runs `ai-agents handoff <task> <from> <to> "what changed"`. That records the commit, types the handoff into the other agent's session, and ends that agent's wait. An agent that is blocked runs `ai-agents wait <task> <me> <other> "what I need"`, and the Monitor shows "⧗ waiting for be: …" until the handoff arrives. `ai-agents inbox <task> <agent>` lists what an agent was handed, for example after a restart.
 
 ## Commands
 
