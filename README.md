@@ -52,6 +52,8 @@ Keys in every screen: Enter chooses, Esc or `← Back` goes back, type to search
 
 An agent that changes something another agent depends on commits it, then runs `ai-agents handoff <task> <from> <to> "what changed"`. That records the commit, types the handoff into the other agent's session, and ends that agent's wait. An agent that is blocked runs `ai-agents wait <task> <me> <other> "what I need"`, and the Monitor shows "⧗ waiting for be: …" until the handoff arrives. `ai-agents inbox <task> <agent>` lists what an agent was handed, for example after a restart.
 
+When an agent is about to edit a file that an agent of another task already changed in the same repo, the first edit is stopped and it is told to message that agent and agree who does it. Once they agree, the same edit goes through. The Monitor shows "⚠ overlap with <task>".
+
 ## Commands
 
 The menu covers everything; these are for scripts and for the agents themselves.

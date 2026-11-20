@@ -319,7 +319,7 @@ read_state() { # <agent>: sets ST, ST_T, ST_D (empty when no hook has reported y
   ST=""; ST_T=0; ST_D=""
   [[ -f "$(state_file "$1")" ]] && IFS=$'\t' read -r ST ST_T ST_D < "$(state_file "$1")" || true
 }
-hook() { # <task> <agent> <event>: Claude Code calls this; it must stay quiet and never fail
+hook() { # <task> <agent> <event>: Claude Code calls this; it never fails, and prints only a decision, on fd 3
   local event="$3" input tool="" what="" msg="" kind=""
   use_task "$1"
   input=$(cat)
@@ -332,7 +332,10 @@ hook() { # <task> <agent> <event>: Claude Code calls this; it must stay quiet an
   case "$event" in
     SessionStart)           set_state "$2" idle "session started" ;;
     UserPromptSubmit)       set_state "$2" working "reading your message" ;;
-    PreToolUse|PostToolUse) set_state "$2" working "${tool}${what:+: $what}" ;;
+    PreToolUse|PostToolUse) set_state "$2" working "${tool}${what:+: $what}"
+                            if [[ "$event" == PreToolUse && "$tool" =~ ^(Edit|Write|MultiEdit|NotebookEdit)$ ]]; then
+                              overlap_gate "$2" "$(jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' <<< "$input" 2>/dev/null)"
+                            fi ;;
     PermissionRequest)      set_state "$2" needs-you "${tool}${what:+: $what}" ;;
     Notification)
       if [[ "$kind" == permission_prompt || ( -z "$kind" && "$msg" == *ermission* ) ]]; then
@@ -454,8 +457,16 @@ resume_all() {
   return 0
 }
 
+default_base() { # <repo or worktree>: origin's default branch (origin/HEAD, else origin/main or origin/master), or nothing
+  local b
+  b=$(git -C "$1" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  if [[ -z "$b" ]]; then
+    for b in origin/main origin/master ""; do [[ -z "$b" ]] || git -C "$1" rev-parse -q --verify "$b^{commit}" >/dev/null && break; done
+  fi
+  echo "$b"
+}
 mkwt() { # <repo> <worktree-path> <branch>
-  local repo="$1" path="$2" br="$3" base="" b
+  local repo="$1" path="$2" br="$3" base=""
   [ -d "$path" ] && return 0
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "no git repository at $repo (check the agent's path with: $PROG repos)"
   with_timeout 30 git -C "$repo" fetch -q origin 2>/dev/null ||
@@ -463,10 +474,7 @@ mkwt() { # <repo> <worktree-path> <branch>
   if git -C "$repo" show-ref -q --verify "refs/heads/$br"; then
     git -C "$repo" worktree add "$path" "$br" || return 1
   else   # from origin's default branch, never from whatever the main checkout has checked out
-    base=$(git -C "$repo" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)
-    if [[ -z "$base" ]]; then
-      for b in origin/main origin/master; do git -C "$repo" rev-parse -q --verify "$b^{commit}" >/dev/null && { base="$b"; break; }; done
-    fi
+    base=$(default_base "$repo")
     [[ -n "$base" ]] || die "$(basename "$repo"): can't tell origin's default branch. Set it with: git -C $repo remote set-head origin -a"
     git -C "$repo" worktree add --no-track -b "$br" "$path" "$base" || return 1
   fi
@@ -552,6 +560,44 @@ inbox() { # <me>: what other agents handed me, and what I still wait for
   return 0
 }
 
+# ---- overlap between tasks: two tasks changing the same file of one repo ----
+# <task folder>/overlaps.tsv: "time<TAB>agent<TAB>file<TAB>other task": the edit was stopped once, the agents talk,
+# then the same edit goes through.
+changed_files() { # <worktree>: files its branch changed against origin's default branch, plus uncommitted ones (cached 10 s)
+  local w="$1" c base
+  c="$CACHE_DIR/changed/$(md5 -q -s "$w")"; mkdir -p "${c%/*}"
+  if [[ -s "$c" && -n "$(find "$c" -mtime -10s 2>/dev/null)" ]]; then tail -n +2 "$c"; return 0; fi
+  base=$(default_base "$w")
+  { echo "#"; { [[ -z "$base" ]] || git -C "$w" diff --name-only "$base...HEAD" 2>/dev/null
+                git -C "$w" status --porcelain 2>/dev/null | cut -c4- | sed 's/.* -> //'; } | sort -u; } > "$c.$$" && mv "$c.$$" "$c"
+  tail -n +2 "$c"
+}
+overlap_of() { # <agent> <file path>: the other task whose worktree of the same repo changed that file, or nothing
+  local r="$1" f="$2" wt wtp rel t ow repo
+  wt=$(wt_dir "$r"); wtp=$(cd "$wt" 2>/dev/null && pwd -P) || return 0
+  case "$f" in "$wt"/*) rel="${f#"$wt"/}" ;; "$wtp"/*) rel="${f#"$wtp"/}" ;; *) return 0 ;; esac
+  repo=$(basename "$(repo_path "$r")")
+  for t in $(all_tasks); do
+    [[ "$t" != "$TASK" ]] || continue
+    ow="$WT_ROOT/$t/$repo"; [[ -d "$ow" ]] || continue
+    changed_files "$ow" | grep -qxF -- "$rel" && { printf '%s\t%s\n' "$t" "$rel"; return 0; }
+  done
+  return 0
+}
+overlap_gate() { # <agent> <file path>: stops the first edit of a file another task changed, and says whom to talk to
+  local r="$1" o t rel f="$WT_ROOT/$TASK/overlaps.tsv" other reason
+  o=$(overlap_of "$r" "$2"); [[ -n "$o" ]] || return 0
+  t="${o%%$TAB*}"; rel="${o#*$TAB}"
+  awk -F'\t' -v a="$r" -v p="$rel" -v t="$t" '$2 == a && $3 == p && $4 == t { f = 1 } END { exit !f }' "$f" 2>/dev/null && return 0   # agreed already
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$r" "$rel" "$t" >> "$f"
+  other="$PREFIX-$r-$t"
+  reason="Stop: $rel is already changed by \"$other\" (task $t, branch $t). Before you edit it, send that agent a message with SendMessage: what you want to change in this file and why, and agree which of you does it. If it doesn't show up in ListAgents, ask me instead. Once you have agreed, make the edit again: it then goes through."
+  jq -n --arg r "$reason" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}' >&3
+  [[ "$NOTIFY" == on ]] && notify_text "$TASK · $(repo_desc "$r") overlaps task $t" "$rel" "The agents are asked to agree who changes it."
+  return 0
+}
+overlap_tasks() { [[ -f "$WT_ROOT/$TASK/overlaps.tsv" ]] || return 0; awk -F'\t' '{ print $4 }' "$WT_ROOT/$TASK/overlaps.tsv" | sort -u | paste -sd, - | sed 's/,/, /g'; }   # this task's overlaps
+
 # ---- tmux helpers: agents are found by a pane tag (@agent <name>), wherever their pane sits ----
 
 session_exists() { tmux has-session -t "=$S" 2>/dev/null; }
@@ -564,6 +610,10 @@ agent_pane() { # <agent> -> pane id, or nothing. Untagged panes in a window name
   return 0   # no session means no pane, not an error
 }
 
+is_up() { # <agent>: running, or launched in the last 30 seconds and still starting (the pane shows the shell until then)
+  is_running "$1" && return 0
+  read_state "$1"; [[ "$ST" == starting && $(( $(date +%s) - ST_T )) -lt 30 ]]
+}
 is_running() { # <agent>: true when the agent's pane runs something other than a plain shell
   local p cmd; p=$(agent_pane "$1"); [[ -n "$p" ]] || return 1
   cmd=$(tmux display-message -p -t "$p" '#{pane_current_command}' 2>/dev/null) || return 1
@@ -793,7 +843,7 @@ start() { # ROLES
   save_choices "$ROLES"
   for r in $ROLES; do
     place "$r" "$LAYOUT"
-    if is_running "$r"; then
+    if is_up "$r"; then
       echo "$(agent_name "$r") is already running${LAYOUT:+ (layout: $LAYOUT)}"
     else
       if [[ -n "$FRESH" ]]; then launch "$r" fresh; else launch "$r" continue; fi
@@ -807,6 +857,9 @@ start() { # ROLES
 stop_one() { # <agent>
   local r="$1" p i
   p=$(agent_pane "$r")
+  if [[ -n "$p" ]] && ! is_running "$r" && is_up "$r"; then   # still starting: wait for it, or it comes up after the stop
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do is_running "$r" && break; sleep 0.5; done
+  fi
   [[ -n "$p" ]] && is_running "$r" || { echo "$(agent_name "$r") is not running"; return 0; }
   [[ "${TMUX_PANE:-}" == "$p" ]] && die "refusing to stop $(agent_name "$r") from inside itself"
   date +%s > "$WT_ROOT/$TASK/$r.stopping"           # tells the watchdog this exit is on purpose (hooks may still report idle)
@@ -839,7 +892,7 @@ resume() {
   for r in $roles; do
     [[ -d "$(wt_dir "$r")" ]] || die "$(agent_name "$r") has no worktree; start it with: $PROG start $TASK $r"
     place "$r" "$LAYOUT"
-    if ! is_running "$r"; then
+    if ! is_up "$r"; then
       if [[ -n "$FRESH" ]]; then launch "$r" fresh; else launch "$r" continue; fi
     fi
   done
@@ -1380,7 +1433,7 @@ git_counts_cached() { # <worktree>: git_counts, reused for 15 seconds (the Monit
 MON_RATE=""
 monitor_lines() { # [raw]: one row per open task with its numbers, its agents indented below it; tasks that need you first
   # raw gives "state<TAB>agent<TAB>age<TAB>usd" per agent, for the header
-  local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop n_wait wt_on ch prs tusd ttok models a b br
+  local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop n_wait wt_on ov ch prs tusd ttok models a b br
   [[ "${1:-}" == raw ]] || MON_RATE=$(usd_rate)
   for s in $(open_sessions); do
     use_task "${s#"$PREFIX-"}"
@@ -1424,6 +1477,7 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
     [[ $n_work -gt 0 ]] && head+="${C_GREEN}● $n_work working${C_RESET}  "
     [[ $n_idle -gt 0 ]] && head+="${C_CYAN}●${C_RESET} $n_idle idle  "
     [[ $n_wait -gt 0 ]] && head+="${C_YELLOW}⧗ $n_wait waiting for an agent${C_RESET}  "
+    ov=$(overlap_tasks); [[ -z "$ov" ]] || head+="${C_YELLOW}⚠ overlap with $ov${C_RESET}  "
     [[ $n_stop -gt 0 ]] && head+="${C_DIM}○ $n_stop stopped${C_RESET}  "
     head+="${C_DIM}·${C_RESET} $(plural "$ch" "changed file")"
     [[ $ttok -gt 0 ]] && head+=" · $(tokens_short "$ttok") tokens · ${C_BOLD}$(money "$tusd" "$MON_RATE")${C_RESET} · ${C_DIM}$(model_list "$models")${C_RESET}"
@@ -2534,7 +2588,7 @@ main() {
     _preview) preview "${1:-}" ;;
     _header)  main_header ;;
     _notify)  notify "$@" ;;
-    _hook)    hook "$@" >/dev/null 2>&1 </dev/stdin || true ;;
+    _hook)    hook "$@" 3>&1 >/dev/null 2>&1 </dev/stdin || true ;;   # only a decision (fd 3) reaches Claude Code
     _watch)   watch "${1:?task}" ;;
     _usage)    agent_usage "${1:?worktree}" ;;
     _activity) activity_of "${1:?worktree}" ;;
