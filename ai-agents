@@ -873,8 +873,9 @@ ensure_task() { # <agents needing a worktree> [goal]: worktrees, role prompts, t
 }
 
 launch() { # <agent> <fresh|continue>
-  local p name prompt rc="" settings m e
+  local p name prompt rc="" settings m e sh
   name=$(agent_name "$1"); p=$(agent_pane "$1"); prompt=$(printf %q "$WT_ROOT/$TASK/$1.prompt.md")
+  CLAUDE_BIN=$(command -v claude) || { echo "claude (Claude Code) is not on PATH" >&2; return 1; }
   [[ -n "$p" ]] || { echo "$name has no pane" >&2; return 1; }   # never type into whatever pane happens to be active
   # Remote Control shows the session in the Claude mobile app and on claude.ai/code
   [[ "$REMOTE" == on ]] && rc="--remote-control $name "
@@ -888,11 +889,13 @@ launch() { # <agent> <fresh|continue>
   set_state "$1" starting "launched"
   # continue the agent's last conversation in its worktree; start fresh only when there is none
   # (not "--continue || fresh": after a crash that would silently throw the conversation away)
-  if [[ "$2" == continue ]] && ls "$(proj_dir "$(wt_dir "$1")")"/*.jsonl >/dev/null 2>&1; then
-    tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG AA_TASK=$TASK AA_AGENT=$1; claude ${rc}--continue --name $name" Enter
-  else
-    tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG AA_TASK=$TASK AA_AGENT=$1; claude ${rc}--name $name \"\$(cat $prompt)\"" Enter
-  fi
+  if [[ "$2" == continue ]] && ls "$(proj_dir "$(wt_dir "$1")")"/*.jsonl >/dev/null 2>&1; then rc+="--continue "
+  else rc+="\"\$(cat $prompt)\" "; fi
+  # the pane runs Claude Code directly (nothing typed into a shell); afterwards it becomes a shell again
+  sh=$(tmux show-options -gv default-command 2>/dev/null || true); [[ -n "$sh" ]] || sh="${SHELL:-/bin/sh} -l"
+  # (bash with job control, so Claude Code gets the terminal and tmux sees it as the pane's command)
+  tmux respawn-pane -k -t "$p" -c "$(wt_dir "$1")" /bin/bash -c \
+    "set -m; unset CLAUDECODE; export AA_ORG=$ORG AA_TASK=$TASK AA_AGENT=$1; $(printf %q "$CLAUDE_BIN") --name $name ${rc}; exec $sh"
 }
 
 attach() {
