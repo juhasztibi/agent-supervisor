@@ -793,6 +793,10 @@ say() { # ROLES (one agent, a list, or every running agent), message in GOAL
       [[ $(count $ROLES) -eq 1 ]] && die "$(agent_name "$r") is not running; start it with: $PROG start $TASK $r"
       echo "skipped $(agent_name "$r"): not running"; continue
     fi
+    if [[ "$(agent_state "$r")" == needs-you ]]; then   # Enter would pick the highlighted answer
+      [[ $(count $ROLES) -eq 1 ]] && die "$(agent_name "$r") is waiting for your answer to a question; open it and answer first"
+      echo "skipped $(agent_name "$r"): waiting for your answer"; continue
+    fi
     tmux send-keys -t "$p" -l -- "$GOAL"
     sleep 0.3
     tmux send-keys -t "$p" Enter
