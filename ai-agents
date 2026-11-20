@@ -362,12 +362,24 @@ on run argv
 end run
 EOF
 }
+LOCKED=""
+lock_task() { # [tries of 0.1 s]: waits until no other command changes this task (agents run start themselves); fails when busy
+  local d="$WT_ROOT/.$TASK.lock" i=0 max="${1:-600}"
+  mkdir -p "$WT_ROOT"
+  until mkdir "$d" 2>/dev/null; do
+    if [[ -n "$(find "$d" -maxdepth 0 -mmin +5 2>/dev/null)" ]]; then rmdir "$d" 2>/dev/null; continue; fi   # left by a killed command
+    i=$((i + 1)); [[ $i -lt $max ]] || return 1
+    sleep 0.1
+  done
+  LOCKED="$d"
+}
+unlock_task() { [[ -z "$LOCKED" ]] || rmdir "$LOCKED" 2>/dev/null; LOCKED=""; return 0; }
 watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$WT_ROOT/$TASK/watchdog.log"; }
 watch_start() { # starts the task's watchdog unless it already runs
   local pidf="$WT_ROOT/$TASK/.watch.pid" pid
   [[ -d "$WT_ROOT/$TASK" ]] || return 0
   pid=$(cat "$pidf" 2>/dev/null || true)
-  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+  [[ -n "$pid" ]] && ps -o command= -p "$pid" 2>/dev/null | grep -q "_watch $TASK\$" && return 0   # a reused pid is not ours
   nohup "$SELF" _watch "$TASK" >/dev/null 2>&1 &
   echo $! > "$pidf"
 }
@@ -383,8 +395,12 @@ watch_agent() { # <agent>: restart a crashed agent, alert when it looks stuck or
         f="$WT_ROOT/$TASK/$r.restarts"
         recent=$(awk -v n="$now" '$1 > n - 3600' "$f" 2>/dev/null | grep -c . || true)
         if [[ "$AUTO_RESTART" == on && "$recent" -lt 3 ]]; then
+          lock_task 20 || return 0                   # a command is changing the task: look again next round
+          read_state "$r"
+          if is_running "$r" || [[ -z "$(agent_pane "$r")" ]] || ! [[ "$ST" =~ ^(idle|working|needs-you)$ ]]; then unlock_task; return 0; fi
           echo "$now" >> "$f"; watch_log "$r crashed while $ST; restarting ($((recent + 1)) of 3 this hour)"
-          launch "$r" continue
+          launch "$r" continue || true
+          unlock_task
           notify_text "$title restarted" "It stopped unexpectedly" "It continues its conversation."
         else
           set_state "$r" crashed "stopped unexpectedly"; watch_log "$r crashed; not restarting"
@@ -421,6 +437,7 @@ watch() { # <task>: the loop; it ends when the task's tmux session is gone
 }
 
 # ---- tasks that were open when the Mac restarted or tmux died ----
+open_sessions() { tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true; }   # tmux sessions of this organisation's tasks
 closed_unexpectedly() { # tasks marked open whose tmux session is gone
   local t out=""
   for t in $(all_tasks); do
@@ -609,6 +626,9 @@ ensure_task() { # <agents needing a worktree> [goal]: worktrees, role prompts, t
     [[ -z "$first" ]] || die "task $TASK has no worktrees"
     tmux select-layout -t "=$S:srv" even-horizontal >/dev/null 2>&1
     CREATED=1
+    for r in $(task_roles); do   # they ended with the old session; the watchdog must not take that for a crash
+      read_state "$r"; [[ "$ST" =~ ^(idle|working|needs-you|starting)$ ]] && set_state "$r" stopped "tmux session closed"
+    done
   else
     srv_panes
   fi
@@ -624,6 +644,7 @@ ensure_task() { # <agents needing a worktree> [goal]: worktrees, role prompts, t
 launch() { # <agent> <fresh|continue>
   local p name prompt rc="" settings m e
   name=$(agent_name "$1"); p=$(agent_pane "$1"); prompt=$(printf %q "$WT_ROOT/$TASK/$1.prompt.md")
+  [[ -n "$p" ]] || { echo "$name has no pane" >&2; return 1; }   # never type into whatever pane happens to be active
   # Remote Control shows the session in the Claude mobile app and on claude.ai/code
   [[ "$REMOTE" == on ]] && rc="--remote-control $name "
   m=$(saved_choice "$1" model); e=$(saved_choice "$1" effort)
@@ -649,6 +670,7 @@ attach() {
 }
 
 open_view() { # <window|tab|here|detached>: show the task's session (on the agent in FOCUS, if set)
+  unlock_task   # attaching can last all day; other commands may change the task meanwhile
   local how="$1" cmd="tmux attach -t '=$S'" script p
   if [[ -n "$FOCUS" ]]; then   # also when detached: the next attach lands on that agent
     p=$(agent_pane "$FOCUS")
@@ -782,7 +804,7 @@ say() { # ROLES (one agent, a list, or every running agent), message in GOAL
 
 list() {
   local s r line found=""
-  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+  for s in $(open_sessions); do
     use_task "${s#"$PREFIX-"}"; line="$TASK"; found=1
     for r in $(known_roles); do
       if is_running "$r"; then
@@ -1293,7 +1315,7 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
   # raw gives "state<TAB>agent<TAB>age<TAB>usd" per agent, for the header
   local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop ch prs tusd ttok models a b br
   [[ "${1:-}" == raw ]] || MON_RATE=$(usd_rate)
-  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+  for s in $(open_sessions); do
     use_task "${s#"$PREFIX-"}"
     trank=9; n_need=0; n_work=0; n_idle=0; n_stop=0; ch=0; prs=""; tusd=0; ttok=0; models=""
     for r in $(known_roles); do
@@ -1809,10 +1831,10 @@ has_prompt() { local r; for r in $1; do [[ -f "$WT_ROOT/$TASK/$r.prompt.md" ]] &
 
 agents_lines() { # the Running agents list; its live refresh calls this too
   local s r w=8
-  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+  for s in $(open_sessions); do
     s="${s#"$PREFIX-"}"; [[ ${#s} -gt $w ]] && w=${#s}
   done
-  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+  for s in $(open_sessions); do
     use_task "${s#"$PREFIX-"}"
     for r in $(known_roles); do
       printf '%s\n' "$TASK|$r$TAB$(printf "%-${w}s" "$TASK")  $(dot "$r" word) ${C_DIM}$(basename "$(repo_path "$r")")${C_RESET}"
@@ -1924,7 +1946,7 @@ flow_inventory() { # main menu: everything available, grouped by global, organis
   loading "Collecting skills, plugins and MCP servers" "And how often the open agents used them"
   CLAUDE_ORG=$(with_timeout 5 claude auth status 2>/dev/null | jq -r '.orgName // empty' 2>/dev/null || true)
   inv=$(inventory)
-  used=$(for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+  used=$(for s in $(open_sessions); do
            use_task "${s#"$PREFIX-"}"; for r in $(task_roles); do agent_tools "$(wt_dir "$r")"; done
          done | awk -F'\t' '{ n[$1 FS $2] += $3 } END { for (k in n) print k FS n[k] }')
   # claude.ai connectors exist in your account, not on disk: they show up once an agent used one
@@ -2173,8 +2195,9 @@ flow_org() { # which GitHub organisation to work in; fails on Esc
 }
 org_watchdogs() { # every open task of $ORG gets its watchdog, also tasks opened by older versions
   local s
-  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
-    use_task "${s#"$PREFIX-"}"; [[ -d "$WT_ROOT/$TASK" ]] && { touch "$WT_ROOT/$TASK/.open"; watch_start; }
+  for s in $(open_sessions); do
+    use_task "${s#"$PREFIX-"}"; [[ -d "$WT_ROOT/$TASK" ]] || continue
+    lock_task 20 || continue; touch "$WT_ROOT/$TASK/.open"; watch_start; unlock_task
   done
   return 0
 }
@@ -2399,6 +2422,7 @@ interactive() { # [monitor]
 
 usage="usage: $PROG [--org owner] (no arguments: interactive menu) | orgs | org [owner] | up <task> [goal] [--only a,b] [--split|--own] [--remote on|off] [--window|--tab|--here|--detached] | start <task> a[,b] [--split|--own] [--fresh] [--remote on|off] [open] | stop <task> a[,b] | resume <task> [--only a,b] [--split|--own] [--fresh] [--remote on|off] [open] | attach <task> [open] | say <task> <agent> <msg> | ls | repos | add-repo <repo|path> [agent] [description] | remove <task> a[,b] [--force] | down <task> [--prune] | help"
 main() {
+  trap unlock_task EXIT
   if [[ "${1:-}" == --org ]]; then [[ -n "${2:-}" ]] || die "--org needs a GitHub owner"; AA_ORG="$2"; ORG_FROM_ENV="$2"; shift 2; fi
   resolve_org
   local cmd="${1:-}"; shift || true
@@ -2417,9 +2441,11 @@ main() {
     help|-h|--help) sed -n '2,/^set -euo/p' "$SELF" | sed -e '$d' -e 's/^# \{0,1\}//' ;;
     up|resume|attach|down)
       check_task "${1:-}"; use_task "$1"; shift; parse "$@"
+      [[ "$cmd" == attach ]] || { lock_task || die "task $TASK is busy with another $PROG command; try again"; }
       case "$cmd" in up) up ;; resume) resume ;; attach) open_view "${OPEN:-here}" ;; down) down ;; esac ;;
     start|stop|say|remove|restart)
       check_task "${1:-}"; use_task "$1"
+      [[ "$cmd" == say ]] || { lock_task || die "task $1 is busy with another $PROG command; try again"; }
       if [[ "$cmd" == say && "${2:-}" == all ]]; then ROLES=$(known_roles); ROLES="${ROLES% }"; [[ -n "$ROLES" ]] || die "task $TASK has no agents"
       else ROLES=$(check_roles "${2:-}"); fi
       shift 2
