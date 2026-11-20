@@ -456,17 +456,23 @@ resume_all() {
 }
 
 mkwt() { # <repo> <worktree-path> <branch>
-  local repo="$1" path="$2" br="$3" base
+  local repo="$1" path="$2" br="$3" base="" b
   [ -d "$path" ] && return 0
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "no git repository at $repo (check the agent's path with: $PROG repos)"
-  git -C "$repo" fetch -q origin
+  with_timeout 30 git -C "$repo" fetch -q origin 2>/dev/null ||
+    echo "$(basename "$repo"): couldn't fetch origin; using the branches it fetched before" >&2
   if git -C "$repo" show-ref -q --verify "refs/heads/$br"; then
-    git -C "$repo" worktree add "$path" "$br"
-  else
-    base=$(git -C "$repo" symbolic-ref -q --short refs/remotes/origin/HEAD || echo HEAD)
-    git -C "$repo" worktree add --no-track -b "$br" "$path" "$base"
+    git -C "$repo" worktree add "$path" "$br" || return 1
+  else   # from origin's default branch, never from whatever the main checkout has checked out
+    base=$(git -C "$repo" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    if [[ -z "$base" ]]; then
+      for b in origin/main origin/master; do git -C "$repo" rev-parse -q --verify "$b^{commit}" >/dev/null && { base="$b"; break; }; done
+    fi
+    [[ -n "$base" ]] || die "$(basename "$repo"): can't tell origin's default branch. Set it with: git -C $repo remote set-head origin -a"
+    git -C "$repo" worktree add --no-track -b "$br" "$path" "$base" || return 1
   fi
 }
+
 
 role_prompt() { # <agent> <goal>
   local me r
@@ -603,7 +609,10 @@ srv_panes() { # one shell per worktree in the srv window; new agents of an open 
 ensure_task() { # <agents needing a worktree> [goal]: worktrees, role prompts, tmux session with the srv window
   local roles="$1" goal="${2:-}" saved r p first=1
   mkdir -p "$WT_ROOT/$TASK"
-  for r in $roles; do mkwt "$(repo_path "$r")" "$(wt_dir "$r")" "$TASK"; done
+  for r in $roles; do
+    mkwt "$(repo_path "$r")" "$(wt_dir "$r")" "$TASK" ||
+      { rmdir "$WT_ROOT/$TASK" 2>/dev/null; die "couldn't create the worktree of $(agent_name "$r")"; }   # no empty task left behind
+  done
   [[ -n "$goal" ]] && printf '%s\n' "$goal" > "$WT_ROOT/$TASK/goal"
   saved="Wait for instructions."
   [[ -f "$WT_ROOT/$TASK/goal" ]] && saved=$(cat "$WT_ROOT/$TASK/goal")
