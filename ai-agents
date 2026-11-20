@@ -144,9 +144,9 @@ owner_lines() { # "owner<TAB>description": your account and every organisation y
   local f="$CACHE_DIR/owners.tsv" d
   mkdir -p "$CACHE_DIR"
   if [[ ! -s "$f" || -z "$(find "$f" -mtime -1 2>/dev/null)" ]] && command -v gh >/dev/null; then
-    { with_timeout 15 gh api user --jq '"\(.login)\tyour own repositories"'
-      with_timeout 15 gh api --paginate user/orgs --jq '.[] | "\(.login)\t\((.description // "") | gsub("[[:cntrl:]]"; " "))"'; } > "$f.tmp" 2>/dev/null || true
-    if [[ -s "$f.tmp" ]]; then mv "$f.tmp" "$f"; else rm -f "$f.tmp"; fi
+    if { with_timeout 15 gh api user --jq '"\(.login)\tyour own repositories"' &&
+         with_timeout 15 gh api --paginate user/orgs --jq '.[] | "\(.login)\t\((.description // "") | gsub("[[:cntrl:]]"; " "))"'; } > "$f.tmp" 2>/dev/null &&
+       [[ -s "$f.tmp" ]]; then mv "$f.tmp" "$f"; else rm -f "$f.tmp"; fi
   fi
   { cat "$f" 2>/dev/null || true
     for d in "$CONFIG_DIR"/orgs/*/; do [[ -d "$d" ]] && printf '%s\t\n' "$(basename "$d")"; done; true; } |
@@ -1371,7 +1371,7 @@ ticker() { # <socket> <seconds> <fzf action>: repeats the action until fzf is go
   local sock="$1" secs="$2" action="$3" i=0
   exec >/dev/null 2>&1 </dev/null
   sleep 0.3   # let fzf open its socket
-  while [[ -S "$sock" && $i -lt 5000 ]]; do
+  while [[ -S "$sock" ]]; do
     curl -s -m 5 --unix-socket "$sock" -H "x-api-key: ${FZF_API_KEY:-}" -X POST http://localhost -d "$action" || exit 0
     i=$((i + 1)); sleep "$secs"
   done
@@ -1382,7 +1382,7 @@ feed() { # <socket> <seconds> <fzf action with @@> <command...>: runs the comman
   exec >/dev/null 2>&1 </dev/null
   out="$sock.$RANDOM.out"
   sleep 0.3   # let fzf open its socket
-  while [[ -S "$sock" && $i -lt 5000 ]]; do
+  while [[ -S "$sock" ]]; do
     if "$@" > "$out.tmp" 2>/dev/null && mv "$out.tmp" "$out"; then
       curl -s -m 5 --unix-socket "$sock" -H "x-api-key: ${FZF_API_KEY:-}" -X POST http://localhost -d "${action//@@/cat '$out'}" || break
     fi
