@@ -145,7 +145,7 @@ owner_lines() { # "owner<TAB>description": your account and every organisation y
   mkdir -p "$CACHE_DIR"
   if [[ ! -s "$f" || -z "$(find "$f" -mtime -1 2>/dev/null)" ]] && command -v gh >/dev/null; then
     { with_timeout 15 gh api user --jq '"\(.login)\tyour own repositories"'
-      with_timeout 15 gh api --paginate user/orgs --jq '.[] | "\(.login)\t\((.description // "") | gsub("[\t\n]"; " "))"'; } > "$f.tmp" 2>/dev/null || true
+      with_timeout 15 gh api --paginate user/orgs --jq '.[] | "\(.login)\t\((.description // "") | gsub("[[:cntrl:]]"; " "))"'; } > "$f.tmp" 2>/dev/null || true
     if [[ -s "$f.tmp" ]]; then mv "$f.tmp" "$f"; else rm -f "$f.tmp"; fi
   fi
   { cat "$f" 2>/dev/null || true
@@ -157,7 +157,7 @@ org_repos() { # "name<TAB>description" of every repository of $ORG that isn't ar
   mkdir -p "$ORG_CACHE"
   if [[ ! -s "$f" || -z "$(find "$f" -mmin -60 2>/dev/null)" ]]; then
     with_timeout 30 gh repo list "$ORG" --no-archived --limit 1000 --json name,description,pushedAt \
-      --jq 'sort_by(.pushedAt) | reverse | .[] | "\(.name)\t\((.description // "") | gsub("[\t\n]"; " "))"' > "$f.tmp" 2>/dev/null || true
+      --jq 'sort_by(.pushedAt) | reverse | .[] | "\(.name)\t\((.description // "") | gsub("[[:cntrl:]]"; " "))"' > "$f.tmp" 2>/dev/null || true
     if [[ -s "$f.tmp" ]]; then mv "$f.tmp" "$f"; else rm -f "$f.tmp"; fi
   fi
   cat "$f" 2>/dev/null || true
@@ -313,7 +313,7 @@ state_file() { echo "$WT_ROOT/$TASK/$1.state"; }
 set_state() { # <agent> <state> <detail> [since]
   local f; f=$(state_file "$1")
   [[ -d "$WT_ROOT/$TASK" ]] || return 0
-  printf '%s\t%s\t%s\n' "$2" "${4:-$(date +%s)}" "$(printf '%s' "${3:-}" | tr '\t\n' '  ' | cut -c1-200)" > "$f.tmp.$$" && mv "$f.tmp.$$" "$f"
+  printf '%s\t%s\t%s\n' "$2" "${4:-$(date +%s)}" "$(printf '%s' "${3:-}" | tr '[:cntrl:]' ' ' | cut -c1-200)" > "$f.tmp.$$" && mv "$f.tmp.$$" "$f"
 }
 read_state() { # <agent>: sets ST, ST_T, ST_D (empty when no hook has reported yet)
   ST=""; ST_T=0; ST_D=""
@@ -834,7 +834,7 @@ add_repo() { # <path> <agent> [description]
   problem=$(path_problem "$1"); [[ -z "$problem" ]] || die "$problem"
   problem=$(key_problem "$2"); [[ -z "$problem" ]] || die "$problem"
   p=$(canon "$1")
-  desc=$(printf '%s' "${3:-}" | tr '\t\n' '  ')
+  desc=$(printf '%s' "${3:-}" | tr '[:cntrl:]' ' ')   # also tab and newline, which would break the registry line
   [[ -n "${desc// }" ]] || desc=$(basename "$p")
   mkdir -p "$ORG_DIR"
   [[ -f "$REPOS_FILE" ]] || printf '# %s agents of %s: <agent><TAB><repo path><TAB><description>\n' "$PROG" "$ORG" > "$REPOS_FILE"
@@ -935,9 +935,9 @@ notify() { # <task> <agent> (older agents pass their session name only): Claude 
     goal=$(cat "$WT_ROOT/$1/goal" 2>/dev/null || true)
     case "$goal" in
       ""|"Wait for my instructions."|"Wait for instructions.") ;;
-      "Work on GitHub issue "*)   # "…/issues/123: Title" becomes "#123 Title"
-        n=$(sed -E -n 's#^Work on GitHub issue [^ ]*/issues/([0-9]+):.*#\1#p' <<< "$goal")
-        sub="#$n ${goal#*: }" ;;
+      "Work on GitHub issue "*)   # "…/issues/123. … Its title, …: "Title"" becomes "#123 Title"
+        n=$(sed -E -n 's#^Work on GitHub issue [^ ]*/issues/([0-9]+)[.:].*#\1#p' <<< "$goal")
+        sub="#$n $(sed -E -n 's#.*as an instruction: "(.*)"$#\1#p' <<< "$goal")" ;;
       *) sub="$goal" ;;
     esac
     [[ ${#sub} -le 90 ]] || sub="${sub:0:87}..."
@@ -1349,10 +1349,10 @@ issue_lines() { # open issues as "url<TAB>label": of ISSUE_REPO when set, else o
   local who='\(if (.assignees | length) > 0 then "   · " + ([.assignees[].login] | join(", ")) else "" end)'
   if [[ -n "$ISSUE_REPO" ]]; then
     with_timeout 20 gh issue list -R "$ISSUE_REPO" --state open --limit 300 --json url,number,title,assignees \
-      --jq ".[] | \"\(.url)\t#\(.number)  \(.title)$who\""
+      --jq ".[] | \"\(.url)\t#\(.number)  \(.title | gsub(\"[[:cntrl:]]\"; \" \"))$who\""
   else
     with_timeout 20 gh search issues --owner "$ORG" --state open --sort updated --limit 300 --json url,number,title,assignees,repository \
-      --jq ".[] | \"\(.url)\t\(.repository.name) #\(.number)  \(.title)$who\""
+      --jq ".[] | \"\(.url)\t\(.repository.name) #\(.number)  \(.title | gsub(\"[[:cntrl:]]\"; \" \"))$who\""
   fi
 }
 issues_where() { echo "${ISSUE_REPO:-every repository of $ORG}"; }
