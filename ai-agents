@@ -1,0 +1,2456 @@
+#!/usr/bin/env bash
+# ai-agents: Claude Code agents that work together on one task, one agent per repo, in tmux.
+#
+# It works with any GitHub repository. The menu starts by asking which GitHub organisation (or your
+# own account) to work in; Start new agents then offers every repository of it and clones the ones
+# you have no local copy of. Commands use the organisation you picked last; --org <owner> or
+# AA_ORG=<owner> picks another one for a single command.
+#
+# Run it without arguments for the interactive menu:
+#   Start new agents | Running agents | Resume agents | Add a repository | Remove agents |
+#   Skills, plugins and MCP servers | Monitor
+#
+# Per task: one git worktree per repo (branch = task name), one tmux session "<prefix>-<task>",
+# and one named Claude Code session per agent (<prefix>-<agent>-<task>). The prefix is per
+# organisation: "<owner>_ag" unless its settings say otherwise. The agents talk to each
+# other through Claude Code's cross-session messaging (SendMessage).
+#
+# Per organisation, in ~/.config/ai-agents/orgs/<owner>/:
+#   repos      the agents, one per repository: "<agent><TAB><repo path><TAB><description>"
+#   settings   optional "<key><TAB><value>" lines: worktrees (folder for task worktrees, default
+#              ~/code/agent-worktrees/<owner>), prefix (tmux and session names), issues (owner/repo
+#              that "New task from a GitHub issue" lists; default: every repository of the owner)
+# New clones go to AA_CLONE_ROOT/<owner>/<repo> (default ~/code/<owner>/<repo>).
+#
+# Layout: each agent runs in its own window (named after the agent) or all of them side by side in
+# one window (agents). The "srv" window (one shell per repo) always comes last.
+#
+# Commands (agents call start, stop and ls themselves, so these stay stable):
+#   up     <task> ["goal"] [--only a,b] [--split|--own] [--remote on|off] [open]  set up a task, start its agents (default be,ui)
+#   start  <task> a[,b] [--split|--own] [--fresh] [--remote on|off] [open]       start agents, or move running ones
+#   stop   <task> a[,b]                                                          stop agents; their panes stay shells
+#   restart <task> a[,b] [--model m] [--effort e]                                stop and continue the conversation, e.g. on another model
+#   resume <task> [--only a,b] [--split|--own] [--fresh] [--remote on|off] [open] restart stopped agents and open them
+#   attach <task> [--agent a] [open]                                             open the task's tmux session (on that agent)
+#   say    <task> <agent>|a,b|all "message"                                      type a message into agents (all: every running one)
+#   ls                                                                           list open tasks and which agents run
+#   repos                                                                        list the agents you can start
+#   prs                                                                          refresh and print pull request status
+#   add-repo <repo|path> [agent] ["description"]                                 register a repo as a new agent
+#                                                                                (a repo name of the organisation is cloned when needed)
+#   orgs                                                                         list your GitHub organisations
+#   org [owner]                                                                  show or set the organisation commands use
+#   remove <task> a[,b] [--force]                                                stop agents and delete their panes and worktrees
+#                                                                                (all agents: the whole task; --force drops uncommitted changes)
+#   resume-all [open]                                                            resume every task that closed unexpectedly (crash, Mac restart)
+#   down   <task> [--prune]                                                      stop everything and clean docker
+#                                                                                (--prune also removes clean worktrees)
+#   menu                                                                         the interactive menu
+#   selftest                                                                     run the automated tests (own tmux server, fake claude; touches nothing of yours)
+#   monitor                                                                      just the monitor: what every agent is doing (tmux: prefix + O toggles it in a side pane)
+#
+#   --split   the agent shares the "agents" window with the other agents
+#   --own     the agent gets its own window
+#   Without either, a new agent uses AA_LAYOUT (own or split, default own) and a running one stays put.
+#   start continues the agent's last conversation; --fresh starts a new one with its role prompt.
+#   --goal "text" sets the goal like the positional "goal", also when it starts with a dash.
+#   --model m / --effort e (up, start, resume, restart): model (fable, opus, sonnet, haiku or a model id)
+#   and effort (low, medium, high, xhigh, max) for every agent started, or per agent: --model be=sonnet,ui=opus.
+#   The task remembers them; "default" goes back to your Claude Code settings.
+#
+#   [open] says where the task's session opens on your Mac:
+#   --window    a new iTerm2 window (Terminal.app if iTerm2 isn't installed)
+#   --tab       a new tab in the front iTerm2 window
+#   --here      this terminal
+#   --detached  nowhere; open it later with: ai-agents attach <task>
+#   Defaults: up and resume use AA_OPEN (window, tab, here or detached; default window), attach uses
+#   --here, and start opens the session only when it had to create it. Agents never open windows.
+#
+# Every agent starts with Remote Control, so it shows up in the Claude mobile app and on
+# claude.ai/code under its own name while it keeps running here. AA_REMOTE=off or --remote off
+# turns that off. Every agent also sends a Mac notification when it needs you; AA_NOTIFY=off
+# turns that off. In tmux, prefix + a opens the menu in a popup.
+#
+# Each agent reports its state through Claude Code hooks (<task folder>/<agent>.state). A watchdog
+# per open task restarts a crashed agent (at most 3 times an hour; AA_AUTO_RESTART=off turns that
+# off) and notifies you when an agent works without a step for 20 minutes or waits for you 10.
+#
+# Agents may run start, stop and ls themselves. down and remove are for humans.
+set -euo pipefail
+
+PROG=ai-agents
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+CONFIG_DIR="${AA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-agents}"
+REPO_ROOTS="${AA_REPO_ROOTS:-$HOME/Projects $HOME/code}"   # where local copies of repositories are looked for
+CLONE_ROOT="${AA_CLONE_ROOT:-$HOME/code}"                   # new clones go to <this>/<owner>/<repo>
+ORG_FROM_ENV="${AA_ORG:-}"                                  # set: the menu skips the organisation question
+DEFAULT_LAYOUT="${AA_LAYOUT:-own}"
+DEFAULT_OPEN="${AA_OPEN:-window}"
+REMOTE="${AA_REMOTE:-on}"
+NOTIFY="${AA_NOTIFY:-on}"                                 # Mac notification when an agent needs you
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ai-agents"
+PR_TTL_MIN=5                                              # pull request status is refreshed in the background this often
+CURRENCY="${AA_CURRENCY:-$(cat "$CONFIG_DIR/currency" 2>/dev/null || echo USD)}"   # costs are shown in this currency (USD, CHF, EUR, ...)
+CLAUDE_PROJECTS="${AA_CLAUDE_PROJECTS:-$HOME/.claude/projects}"   # where Claude Code keeps session files
+AUTO_RESTART="${AA_AUTO_RESTART:-on}"                     # the watchdog restarts a crashed agent (at most 3 times an hour)
+WATCH_SEC="${AA_WATCH_SEC:-30}"                           # how often the watchdog looks
+STUCK_SEC="${AA_STUCK_SEC:-1200}"                         # "working" without a step for this long counts as stuck
+REMIND_SEC="${AA_REMIND_SEC:-600}"                        # remind once when an agent waits for you this long
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+[[ "$DEFAULT_LAYOUT" == own || "$DEFAULT_LAYOUT" == split ]] || die "AA_LAYOUT must be own or split"
+[[ "$DEFAULT_OPEN" =~ ^(window|tab|here|detached)$ ]] || die "AA_OPEN must be window, tab, here or detached"
+[[ "$REMOTE" == on || "$REMOTE" == off ]] || die "AA_REMOTE must be on or off"
+[[ "$NOTIFY" == on || "$NOTIFY" == off ]] || die "AA_NOTIFY must be on or off"
+[[ "$AUTO_RESTART" == on || "$AUTO_RESTART" == off ]] || die "AA_AUTO_RESTART must be on or off"
+[[ -n "${CLAUDECODE:-}" ]] && DEFAULT_OPEN=detached   # called by an agent: never open windows
+
+# ---- GitHub organisation: everything below works inside one owner (an organisation or your account) ----
+
+ORG="" ORG_DIR="" REPOS_FILE="" WT_ROOT="" PREFIX="" ISSUE_REPO="" ORG_CACHE="" LAST_CHOICE_FILE=""
+org_setting() { awk -F'\t' -v k="$2" '$1 == k { print $2; exit }' "$CONFIG_DIR/orgs/$1/settings" 2>/dev/null || true; }   # <owner> <key>
+org_prefix() { # <owner>: its tmux prefix; "_" can't occur in a GitHub name, so one owner's prefix never starts another's
+  local p; p=$(org_setting "$1" prefix)
+  echo "${AA_PREFIX:-${p:-$(echo "$1" | tr 'A-Z' 'a-z')_ag}}"
+}
+org_worktrees() { local w; w=$(org_setting "$1" worktrees); w="${w:-$HOME/code/agent-worktrees/$1}"; echo "${AA_WT_ROOT:-${w/#\~/$HOME}}"; }
+use_org() { # <owner>: makes it the organisation everything works in
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die "not a GitHub owner name: $1"
+  ORG="$1"; ORG_DIR="$CONFIG_DIR/orgs/$1"; REPOS_FILE="$ORG_DIR/repos"; LAST_CHOICE_FILE="$ORG_DIR/last-choice"
+  WT_ROOT=$(org_worktrees "$1"); PREFIX=$(org_prefix "$1"); ORG_CACHE="$CACHE_DIR/orgs/$1"
+  ISSUE_REPO="${AA_ISSUE_REPO:-$(org_setting "$1" issues)}"
+  export AA_ORG="$1"   # the watchdog, hooks, menu helpers and agents started from here inherit it
+  load_repos
+}
+org_of_dir() { # <folder>: the owner whose task worktrees hold it (agents call us from their worktree)
+  local d o w
+  for d in "$CONFIG_DIR"/orgs/*/; do
+    [[ -d "$d" ]] || continue
+    o=$(basename "$d"); w=$(org_worktrees "$o")
+    [[ "$1/" == "$w/"* ]] && { echo "$o"; return 0; }
+  done
+  return 0
+}
+resolve_org() { # AA_ORG, else the organisation of the folder we run in, else the one you picked last
+  local o="${AA_ORG:-}"
+  [[ -n "$o" ]] || o=$(org_of_dir "$PWD")
+  [[ -n "$o" ]] || o=$(cat "$CONFIG_DIR/org" 2>/dev/null || true)
+  [[ -z "$o" ]] || use_org "$o"
+}
+need_org() { [[ -n "$ORG" ]] || die "pick a GitHub organisation first: run $PROG, or add --org <owner> (list them with: $PROG orgs)"; }
+remember_org() { mkdir -p "$CONFIG_DIR"; echo "$ORG" > "$CONFIG_DIR/org"; }
+
+owner_lines() { # "owner<TAB>description": your account and every organisation you belong to (cached for a day), plus set-up ones
+  local f="$CACHE_DIR/owners.tsv" d
+  mkdir -p "$CACHE_DIR"
+  if [[ ! -s "$f" || -z "$(find "$f" -mtime -1 2>/dev/null)" ]] && command -v gh >/dev/null; then
+    { with_timeout 15 gh api user --jq '"\(.login)\tyour own repositories"'
+      with_timeout 15 gh api --paginate user/orgs --jq '.[] | "\(.login)\t\((.description // "") | gsub("[\t\n]"; " "))"'; } > "$f.tmp" 2>/dev/null || true
+    if [[ -s "$f.tmp" ]]; then mv "$f.tmp" "$f"; else rm -f "$f.tmp"; fi
+  fi
+  { cat "$f" 2>/dev/null || true
+    for d in "$CONFIG_DIR"/orgs/*/; do [[ -d "$d" ]] && printf '%s\t\n' "$(basename "$d")"; done; true; } |
+    awk -F'\t' 'NF && !seen[tolower($1)]++'
+}
+org_repos() { # "name<TAB>description" of every repository of $ORG that isn't archived, last pushed first (cached for an hour)
+  local f="$ORG_CACHE/repos.tsv"
+  mkdir -p "$ORG_CACHE"
+  if [[ ! -s "$f" || -z "$(find "$f" -mmin -60 2>/dev/null)" ]]; then
+    with_timeout 30 gh repo list "$ORG" --no-archived --limit 1000 --json name,description,pushedAt \
+      --jq 'sort_by(.pushedAt) | reverse | .[] | "\(.name)\t\((.description // "") | gsub("[\t\n]"; " "))"' > "$f.tmp" 2>/dev/null || true
+    if [[ -s "$f.tmp" ]]; then mv "$f.tmp" "$f"; else rm -f "$f.tmp"; fi
+  fi
+  cat "$f" 2>/dev/null || true
+}
+lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+set_up_names() { # repository names (lowercase) that already have an agent
+  local i; for i in "${!R_PATHS[@]}"; do lower "$(basename "$(gh_slug "${R_PATHS[$i]}")")"; echo; lower "$(basename "${R_PATHS[$i]}")"; echo; done
+}
+find_clone() { # <repo name>: a local copy of $ORG/<repo name>, or nothing
+  local root g want; want=$(lower "$ORG/$1")
+  for root in $REPO_ROOTS "$CLONE_ROOT/$ORG"; do
+    for g in "$root"/*/.git; do
+      [[ -d "$g" && "$(lower "$(gh_slug "${g%/.git}")")" == "$want" ]] && { echo "${g%/.git}"; return 0; }
+    done
+  done
+  return 0
+}
+org_add() { # <repo name> [agent] [description]: a repository of $ORG as a new agent, cloned when there is no local copy; prints the agent
+  local name="$1" key="${2:-}" desc="${3:-}" path
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "not a repository name: $name"
+  path=$(find_clone "$name")
+  if [[ -z "$path" ]]; then
+    path="$CLONE_ROOT/$ORG/$name"
+    [[ ! -e "$path" ]] || die "$path exists but is not a clone of $ORG/$name"
+    mkdir -p "${path%/*}"
+    gh repo clone "$ORG/$name" "$path" -- -q >/dev/null 2>&1 || { rm -rf "$path"; die "couldn't clone $ORG/$name. Check: gh auth status"; }
+  fi
+  [[ -n "$key" ]] || key=$(suggest_key "$name")
+  [[ -n "$desc" ]] || desc=$(org_repos | awk -F'\t' -v n="$name" '$1 == n { print $2; exit }')
+  add_repo "$path" "$key" "${desc:-$name}" >/dev/null
+  echo "$key"
+}
+
+# ---- repo registry: one line per agent, "<agent><TAB><repo path><TAB><description>" ----
+
+repo_lines() { if [[ -f "$REPOS_FILE" ]]; then awk -F'\t' '!/^#/ && NF >= 3' "$REPOS_FILE"; fi; return 0; }
+R_KEYS=() R_PATHS=() R_DESCS=()
+load_repos() { # read the registry once; lookups below then need no extra processes
+  local k p d
+  R_KEYS=() R_PATHS=() R_DESCS=()
+  while IFS=$'\t' read -r k p d; do R_KEYS+=("$k"); R_PATHS+=("$p"); R_DESCS+=("$d"); done < <(repo_lines)
+}
+all_roles() { echo "${R_KEYS[*]}"; }
+repo_field() { # <agent> <1 name|2 path|3 description>
+  local i
+  for i in "${!R_KEYS[@]}"; do
+    [[ "${R_KEYS[$i]}" == "$1" ]] || continue
+    case "$2" in 1) echo "${R_KEYS[$i]}" ;; 2) echo "${R_PATHS[$i]}" ;; *) echo "${R_DESCS[$i]}" ;; esac
+    return 0
+  done
+}
+repo_path() { repo_field "$1" 2; }
+repo_desc() { repo_field "$1" 3; }
+is_role() { [[ -n "$1" && -n "$(repo_field "$1" 1)" ]]; }
+role_index() { local i=0 x; for x in $(all_roles); do [[ "$x" == "$1" ]] && { echo "$i"; return; }; i=$((i + 1)); done; echo 999; }
+in_list() { [[ " $2 " == *" $1 "* ]]; }
+ordered() { local r out=""; for r in $(all_roles); do in_list "$r" "$1" && out+="$r "; done; echo "${out% }"; }
+csv() { echo $1 | tr ' ' ','; }
+
+check_task() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "task name must be lowercase letters, digits, - or _ (docker compose rule)"; }
+check_roles() { # "a,b" -> "a b" in registry order
+  local r list=""
+  [[ -n "${1:-}" ]] || die "name at least one agent: $(all_roles)"
+  for r in $(echo "$1" | tr ',' ' '); do is_role "$r" || die "unknown agent '$r'; agents: $(all_roles)"; list+="$r "; done
+  ordered "$list"
+}
+
+use_task() { TASK="$1"; S="$PREFIX-$1"; }
+wt_dir() { local p; p=$(repo_path "$1"); echo "$WT_ROOT/$TASK/${p##*/}"; }
+agent_name() { echo "$PREFIX-$1-$TASK"; }
+task_roles() { local r; for r in $(all_roles); do [[ -d "$(wt_dir "$r")" ]] && printf '%s ' "$r"; done; return 0; }
+known_roles() { # agents with a worktree or a pane in this task
+  local r; for r in $(all_roles); do
+    if [[ -d "$(wt_dir "$r")" || -n "$(agent_pane "$r")" ]]; then printf '%s ' "$r"; fi
+  done; return 0
+}
+
+LAYOUT=""; ONLY=""; FRESH=""; GOAL=""; PRUNE=""; FORCE=""; OPEN=""; CREATED=""; FOCUS=""; MODELS=""; EFFORTS=""
+parse() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --split)       LAYOUT=split ;;
+      --own)         LAYOUT=own ;;
+      --only)        ONLY=$(check_roles "${2:-}"); shift ;;
+      --fresh)       FRESH=1 ;;
+      --prune)       PRUNE=1 ;;
+      --force)       FORCE=1 ;;
+      --remote)      [[ "${2:-}" == on || "${2:-}" == off ]] || die "--remote takes on or off"; REMOTE="$2"; shift ;;
+      --goal)        GOAL="${2:-}"; shift ;;
+      --model)       MODELS="${2:-}"; check_choice model "$MODELS"; shift ;;
+      --effort)      EFFORTS="${2:-}"; check_choice effort "$EFFORTS"; shift ;;
+      --agent)       FOCUS=$(check_roles "${2:-}"); [[ "$FOCUS" != *" "* ]] || die "--agent takes one agent"; shift ;;
+      --window|--tab|--here|--detached) OPEN="${1#--}" ;;
+      --*)           die "unknown option $1" ;;
+      *)             GOAL="$1" ;;
+    esac
+    shift
+  done
+}
+
+# Model and effort per agent: --model opus or --model be=sonnet,ui=opus (same for --effort).
+# The choice is saved as <agent>.model / <agent>.effort in the task folder, so a resume keeps it;
+# "default" removes it, and the agent then follows your Claude Code settings.
+EFFORT_LEVELS="low medium high xhigh max"
+MODEL_RE='^[a-z0-9][-a-z0-9.]*(\[[a-z0-9]+\])?$'   # an alias or model id, optionally with a [1m] style suffix
+check_choice() { # <model|effort> <spec>
+  local item v
+  [[ -n "$2" ]] || die "--$1 needs a value"
+  for item in $(echo "$2" | tr ',' ' '); do
+    v="${item#*=}"
+    if [[ "$item" == *=* ]]; then is_role "${item%%=*}" || die "--$1: unknown agent '${item%%=*}'"; fi
+    [[ "$v" == default ]] && continue
+    if [[ "$1" == effort ]]; then in_list "$v" "$EFFORT_LEVELS" || die "--effort takes $EFFORT_LEVELS or default, not '$v'"
+    else [[ "$v" =~ $MODEL_RE ]] || die "--model: '$v' is not a model name or alias (fable, opus, sonnet, haiku)"; fi
+  done
+}
+choice_for() { # <spec> <agent>: the value meant for that agent, if any
+  local item
+  [[ -n "$1" ]] || return 0
+  if [[ "$1" != *=* ]]; then echo "$1"; return 0; fi
+  for item in $(echo "$1" | tr ',' ' '); do [[ "${item%%=*}" == "$2" ]] && echo "${item#*=}"; done
+  return 0
+}
+save_choices() { # <agents>: stores what --model and --effort say for them
+  local r k spec v f
+  for r in $1; do
+    for k in model effort; do
+      [[ $k == model ]] && spec="$MODELS" || spec="$EFFORTS"
+      v=$(choice_for "$spec" "$r"); f="$WT_ROOT/$TASK/$r.$k"
+      [[ -n "$v" ]] || continue
+      if [[ "$v" == default ]]; then rm -f "$f"; else mkdir -p "$WT_ROOT/$TASK"; echo "$v" > "$f"; fi
+    done
+  done
+}
+saved_choice() { cat "$WT_ROOT/$TASK/$1.$2" 2>/dev/null || true; }   # <agent> <model|effort>
+
+# ---- agent state, written by Claude Code hooks ----
+# <task folder>/<agent>.state holds "state<TAB>since (epoch)<TAB>detail". States: starting, idle, working,
+# needs-you, stopped (ended on purpose), crashed (ended unexpectedly and not restarted).
+HOOK_EVENTS="SessionStart UserPromptSubmit PreToolUse PostToolUse PermissionRequest Notification Stop StopFailure SessionEnd"
+hook_settings() { # <agent>: the --settings JSON with our hooks
+  local ev out="" cmd
+  for ev in $HOOK_EVENTS; do
+    cmd="AA_ORG=$ORG $SELF _hook $TASK $1 $ev"
+    case "$ev" in
+      PreToolUse|PostToolUse|PermissionRequest) out+="\"$ev\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"command\":\"$cmd\"}]}]," ;;
+      *) out+="\"$ev\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$cmd\"}]}]," ;;
+    esac
+  done
+  printf '{"hooks":{%s}}\n' "${out%,}"
+}
+state_file() { echo "$WT_ROOT/$TASK/$1.state"; }
+set_state() { # <agent> <state> <detail> [since]
+  local f; f=$(state_file "$1")
+  [[ -d "$WT_ROOT/$TASK" ]] || return 0
+  printf '%s\t%s\t%s\n' "$2" "${4:-$(date +%s)}" "$(printf '%s' "${3:-}" | tr '\t\n' '  ' | cut -c1-200)" > "$f.tmp.$$" && mv "$f.tmp.$$" "$f"
+}
+read_state() { # <agent>: sets ST, ST_T, ST_D (empty when no hook has reported yet)
+  ST=""; ST_T=0; ST_D=""
+  [[ -f "$(state_file "$1")" ]] && IFS=$'\t' read -r ST ST_T ST_D < "$(state_file "$1")" || true
+}
+hook() { # <task> <agent> <event>: Claude Code calls this; it must stay quiet and never fail
+  local event="$3" input tool="" what="" msg="" kind=""
+  use_task "$1"
+  input=$(cat)
+  if command -v jq >/dev/null; then
+    tool=$(jq -r '.tool_name // empty' <<< "$input" 2>/dev/null || true)
+    what=$(jq -r '.tool_input | if type == "object" then (.description // .command // .file_path // .pattern // .url // .skill // "") else "" end' <<< "$input" 2>/dev/null || true)
+    msg=$(jq -r '.message // empty' <<< "$input" 2>/dev/null || true)
+    kind=$(jq -r '.notification_type // empty' <<< "$input" 2>/dev/null || true)
+  fi
+  case "$event" in
+    SessionStart)           set_state "$2" idle "session started" ;;
+    UserPromptSubmit)       set_state "$2" working "reading your message" ;;
+    PreToolUse|PostToolUse) set_state "$2" working "${tool}${what:+: $what}" ;;
+    PermissionRequest)      set_state "$2" needs-you "${tool}${what:+: $what}" ;;
+    Notification)
+      if [[ "$kind" == permission_prompt || ( -z "$kind" && "$msg" == *ermission* ) ]]; then
+        read_state "$2"; [[ "$ST" == needs-you ]] || set_state "$2" needs-you "${msg:-needs your permission}"
+      fi
+      [[ "$NOTIFY" == on ]] && notify "$1" "$2" <<< "$input" ;;
+    Stop)                   set_state "$2" idle "finished its turn" ;;
+    StopFailure)            set_state "$2" idle "its turn ended with an error" ;;
+    SessionEnd)             set_state "$2" stopped "session ended" ;;
+  esac
+  return 0
+}
+interrupted() { # <agent>: true when the newest session file ends with Claude Code's "interrupted" marker (you pressed Esc)
+  local pdir f
+  pdir="$CLAUDE_PROJECTS/$(printf '%s' "$(wt_dir "$1")" | sed 's/[^A-Za-z0-9]/-/g')"
+  f=$(ls -t "$pdir"/*.jsonl 2>/dev/null | head -n 1)
+  [[ -n "$f" ]] && tail -n 3 "$f" | grep -q 'Request interrupted by user'
+}
+
+# ---- watchdog: one small background loop per open task; it ends with the task ----
+notify_text() { # <title> <subtitle> <text>
+  [[ "$NOTIFY" == on ]] && command -v osascript >/dev/null || return 0
+  osascript - "$1" "$2" "$3" >/dev/null 2>&1 <<'EOF' || true
+on run argv
+  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv) sound name "Glass"
+end run
+EOF
+}
+watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$WT_ROOT/$TASK/watchdog.log"; }
+watch_start() { # starts the task's watchdog unless it already runs
+  local pidf="$WT_ROOT/$TASK/.watch.pid" pid
+  [[ -d "$WT_ROOT/$TASK" ]] || return 0
+  pid=$(cat "$pidf" 2>/dev/null || true)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+  nohup "$SELF" _watch "$TASK" >/dev/null 2>&1 &
+  echo $! > "$pidf"
+}
+watch_agent() { # <agent>: restart a crashed agent, alert when it looks stuck or waits for you too long
+  local r="$1" now last f n recent title
+  read_state "$r"; [[ -n "$ST" ]] || return 0   # started before hooks existed: nothing reliable to act on
+  now=$(date +%s); title="$TASK · $(repo_desc "$r")"
+  if ! is_running "$r"; then
+    case "$ST" in
+      starting) [[ $((now - ST_T)) -gt 120 ]] && { set_state "$r" crashed "did not start"; watch_log "$r did not start"; notify_text "$title did not start" "" "Start it again from the menu."; } ;;
+      idle|working|needs-you)   # it was alive and ended without saying so: a crash
+        [[ $((now - $(cat "$WT_ROOT/$TASK/$r.stopping" 2>/dev/null || echo 0))) -lt 60 ]] && return 0   # being stopped right now
+        f="$WT_ROOT/$TASK/$r.restarts"
+        recent=$(awk -v n="$now" '$1 > n - 3600' "$f" 2>/dev/null | grep -c . || true)
+        if [[ "$AUTO_RESTART" == on && "$recent" -lt 3 ]]; then
+          echo "$now" >> "$f"; watch_log "$r crashed while $ST; restarting ($((recent + 1)) of 3 this hour)"
+          launch "$r" continue
+          notify_text "$title restarted" "It stopped unexpectedly" "It continues its conversation."
+        else
+          set_state "$r" crashed "stopped unexpectedly"; watch_log "$r crashed; not restarting"
+          notify_text "$title crashed" "" "Restarted 3 times in the last hour, so not again. Start it from the menu."
+        fi ;;
+    esac
+    return 0
+  fi
+  case "$ST" in
+    working)
+      last="$ST_T"
+      n=$(ls -t "$CLAUDE_PROJECTS/$(printf '%s' "$(wt_dir "$r")" | sed 's/[^A-Za-z0-9]/-/g')"/*.jsonl 2>/dev/null | head -n 1)
+      [[ -n "$n" ]] && n=$(stat -f %m "$n") && [[ "$n" -gt "$last" ]] && last="$n"
+      if [[ $((now - last)) -gt $STUCK_SEC && "$ST_D" != *"[alerted]" ]]; then
+        set_state "$r" working "$ST_D [alerted]" "$ST_T"; watch_log "$r working without a step for $(( (now - last) / 60 )) min"
+        notify_text "$title may be stuck" "No step for $(( (now - last) / 60 )) minutes" "${ST_D:-working}"
+      fi ;;
+    needs-you)
+      if [[ $((now - ST_T)) -gt $REMIND_SEC && "$ST_D" != *"[reminded]" ]]; then
+        set_state "$r" needs-you "$ST_D [reminded]" "$ST_T"; watch_log "$r still waiting for you"
+        notify_text "$title still needs you" "Waiting for $(( (now - ST_T) / 60 )) minutes" "${ST_D:-}"
+      fi ;;
+  esac
+  return 0
+}
+watch() { # <task>: the loop; it ends when the task's tmux session is gone
+  use_task "$1"
+  local r
+  while session_exists; do
+    for r in $(known_roles); do watch_agent "$r" || true; done
+    sleep "$WATCH_SEC"
+  done
+  rm -f "$WT_ROOT/$TASK/.watch.pid"
+}
+
+# ---- tasks that were open when the Mac restarted or tmux died ----
+closed_unexpectedly() { # tasks marked open whose tmux session is gone
+  local t out=""
+  for t in $(all_tasks); do
+    use_task "$t"
+    [[ -f "$WT_ROOT/$t/.open" ]] && ! session_exists && out+="$t "
+  done
+  echo "${out% }"
+}
+resume_all() {
+  local t list
+  list=$(closed_unexpectedly)
+  [[ -n "$list" ]] || { echo "no task closed unexpectedly"; return 0; }
+  for t in $list; do "$SELF" resume "$t" --detached || echo "could not resume $t"; done
+  [[ -n "$OPEN" && "$OPEN" != detached ]] && { use_task "${list%% *}"; open_view "$OPEN"; }
+  return 0
+}
+
+mkwt() { # <repo> <worktree-path> <branch>
+  local repo="$1" path="$2" br="$3" base
+  [ -d "$path" ] && return 0
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "no git repository at $repo (check the agent's path with: $PROG repos)"
+  git -C "$repo" fetch -q origin
+  if git -C "$repo" show-ref -q --verify "refs/heads/$br"; then
+    git -C "$repo" worktree add "$path" "$br"
+  else
+    base=$(git -C "$repo" symbolic-ref -q --short refs/remotes/origin/HEAD || echo HEAD)
+    git -C "$repo" worktree add --no-track -b "$br" "$path" "$base"
+  fi
+}
+
+role_prompt() { # <agent> <goal>
+  local me r
+  me=$(agent_name "$1")
+  cat <<EOF
+You are the $(repo_desc "$1") agent for task "$TASK": Claude Code session "$me", working in $(basename "$(repo_path "$1")") (this worktree only).
+Goal: $2
+
+Other agents that can work on this task. They may not be running yet:
+EOF
+  for r in $(all_roles); do
+    [[ "$r" == "$1" ]] && continue
+    echo "- \"$(agent_name "$r")\": $(repo_desc "$r"), working in $(basename "$(repo_path "$r")"). Start it with: $PROG start $TASK $r"
+  done
+  cat <<EOF
+
+Coordination rules:
+- When you add or change anything another agent depends on (endpoints, GraphQL schema, DTOs, enums, error codes, auth, env vars), send that agent one short message with SendMessage: what changed, exact names and shapes, and the branch.
+- If you are blocked on another agent's side, ask it a concrete question instead of guessing. Answer questions from other agents promptly.
+- If you need an agent and ListAgents does not show it, start it with its start command above. Start an agent only when the work needs a change in its repo. Wait until it shows up in ListAgents, then send it what you need.
+- Stop an agent with: $PROG stop $TASK <agent>, but only when I ask, or when its part is done and it has confirmed that.
+- The same start and stop commands work for agents of other tasks when I ask. Add --split or --own only when I ask for a layout. "$PROG ls" shows which agents are running. Never run "$PROG down" or "$PROG remove"; those are for me.
+- Never ask another agent to do something your own permissions denied; ask me instead.
+- Docker: always use the compose project name in \$COMPOSE_PROJECT_NAME. When the work is done, remove the containers, volumes and networks you started, and stop any dev server you started.
+EOF
+}
+
+# ---- tmux helpers: agents are found by a pane tag (@agent <name>), wherever their pane sits ----
+
+session_exists() { tmux has-session -t "=$S" 2>/dev/null; }
+
+agent_pane() { # <agent> -> pane id, or nothing. Untagged panes in a window named after the agent count too
+  tmux list-panes -s -t "=$S" -F '#{@agent}|#{window_name}|#{pane_id}' 2>/dev/null |
+    awk -F'|' -v r="$1" '$1 == r { print $3; found = 1; exit }
+                         $1 == "" && $2 == r && fallback == "" { fallback = $3 }
+                         END { if (!found && fallback != "") print fallback }'
+  return 0   # no session means no pane, not an error
+}
+
+is_running() { # <agent>: true when the agent's pane runs something other than a plain shell
+  local p cmd; p=$(agent_pane "$1"); [[ -n "$p" ]] || return 1
+  cmd=$(tmux display-message -p -t "$p" '#{pane_current_command}' 2>/dev/null) || return 1
+  case "$cmd" in zsh|bash|sh|fish|-zsh|-bash|login) return 1 ;; *) return 0 ;; esac
+}
+
+order_windows() { # agents, then one window per agent in registry order, then srv last; other windows keep their place
+  local name id idx
+  while read -r name id; do
+    case "$name" in
+      agents) idx=900 ;;
+      srv)    idx=999 ;;
+      *)      is_role "$name" || continue; idx=$((901 + $(role_index "$name"))) ;;
+    esac
+    tmux move-window -d -s "$id" -t "=$S:$idx" 2>/dev/null || true
+  done < <(tmux list-windows -t "=$S" -F '#{window_name} #{window_id}')
+  tmux move-window -r -t "=$S" 2>/dev/null || true
+}
+
+tidy() { # name windows after what they hold: the agent, or agents (with pane titles)
+  local r p
+  for r in $(all_roles); do
+    p=$(agent_pane "$r"); [[ -n "$p" ]] || continue
+    if [[ "$(tmux display-message -p -t "$p" '#{window_panes}')" -gt 1 ]]; then
+      tmux rename-window -t "$p" agents
+      tmux set-option -w -t "$p" pane-border-status top
+      tmux set-option -w -t "$p" pane-border-format ' #{?@agent,#{@agent} agent,} '
+    else
+      tmux rename-window -t "$p" "$r"
+      tmux set-option -w -u -t "$p" pane-border-status 2>/dev/null || true
+    fi
+  done
+  order_windows
+}
+
+ANCHOR=""; BEFORE=""
+split_anchor() { # <agent>: pick the pane to split next to (ANCHOR) and the side (BEFORE), keeping registry order
+  local r="$1" a w n p win="" winpanes=0 me
+  ANCHOR=""; BEFORE=""
+  while IFS='|' read -r a w n p; do   # the shared window: one that already holds several agents, else any agent's
+    [[ -n "$a" && "$a" != "$r" ]] || continue
+    if [[ -z "$win" || ( "$n" -gt 1 && "$winpanes" -le 1 ) ]]; then win="$w"; winpanes="$n"; fi
+  done < <(tmux list-panes -s -t "=$S" -F '#{@agent}|#{window_id}|#{window_panes}|#{pane_id}')
+  [[ -n "$win" ]] || return 1
+  me=$(role_index "$r")
+  while IFS='|' read -r a p; do       # panes left to right
+    [[ -n "$a" && "$a" != "$r" ]] || continue
+    if [[ "$(role_index "$a")" -gt "$me" ]]; then ANCHOR="$p"; BEFORE="-b"; return 0; fi
+    ANCHOR="$p"
+  done < <(tmux list-panes -t "$win" -F '#{@agent}|#{pane_id}')
+  return 0
+}
+
+place() { # <agent> <split|own|""> : make sure the agent has a pane, laid out as asked
+  local r="$1" want="$2" pane dir moved=""
+  pane=$(agent_pane "$r"); dir=$(wt_dir "$r")
+  if [[ -z "$pane" ]]; then
+    [[ -n "$want" ]] || want="$DEFAULT_LAYOUT"
+    if [[ "$want" == split ]] && split_anchor "$r"; then
+      pane=$(tmux split-window -h $BEFORE -d -P -F '#{pane_id}' -t "$ANCHOR" -c "$dir"); moved=1
+    else
+      pane=$(tmux new-window -d -P -F '#{pane_id}' -t "=$S" -n "$r" -c "$dir")
+    fi
+    tmux set-option -p -t "$pane" @agent "$r"
+  elif [[ "$want" == own && "$(tmux display-message -p -t "$pane" '#{window_panes}')" -gt 1 ]]; then
+    tmux break-pane -d -s "$pane" -n "$r"
+  elif [[ "$want" == split ]] && split_anchor "$r" &&
+       [[ "$(tmux display-message -p -t "$pane" '#{window_id}')" != "$(tmux display-message -p -t "$ANCHOR" '#{window_id}')" ]]; then
+    tmux join-pane -d -h $BEFORE -s "$pane" -t "$ANCHOR"; moved=1
+  fi
+  [[ -n "$moved" ]] && tmux select-layout -t "$pane" even-horizontal >/dev/null 2>&1
+  tidy
+}
+
+srv_panes() { # one shell per worktree in the srv window; new agents of an open task get theirs too
+  local r p path have=""
+  tmux list-windows -t "=$S" -F '#{window_name}' | grep -qx srv || return 0
+  while IFS='|' read -r r p path; do    # tag shells of sessions made by older versions by their folder
+    if [[ -z "$r" ]]; then
+      for r in $(task_roles); do
+        if [[ "$path" == "$(wt_dir "$r")"* ]]; then tmux set-option -p -t "$p" @srv "$r"; break; fi
+        r=""
+      done
+    fi
+    [[ -n "$r" ]] && have+="$r "
+  done < <(tmux list-panes -t "=$S:srv" -F '#{@srv}|#{pane_id}|#{pane_current_path}')
+  for r in $(task_roles); do
+    in_list "$r" "$have" && continue
+    p=$(tmux split-window -h -d -P -F '#{pane_id}' -t "=$S:srv" -c "$(wt_dir "$r")")
+    tmux set-option -p -t "$p" @srv "$r"
+    tmux select-layout -t "=$S:srv" even-horizontal >/dev/null 2>&1
+  done
+}
+
+ensure_task() { # <agents needing a worktree> [goal]: worktrees, role prompts, tmux session with the srv window
+  local roles="$1" goal="${2:-}" saved r p first=1
+  mkdir -p "$WT_ROOT/$TASK"
+  for r in $roles; do mkwt "$(repo_path "$r")" "$(wt_dir "$r")" "$TASK"; done
+  [[ -n "$goal" ]] && printf '%s\n' "$goal" > "$WT_ROOT/$TASK/goal"
+  saved="Wait for instructions."
+  [[ -f "$WT_ROOT/$TASK/goal" ]] && saved=$(cat "$WT_ROOT/$TASK/goal")
+  for r in $(task_roles); do
+    if [[ -n "$goal" || ! -f "$WT_ROOT/$TASK/$r.prompt.md" ]]; then
+      role_prompt "$r" "$saved" > "$WT_ROOT/$TASK/$r.prompt.md"
+    fi
+  done
+  if ! session_exists; then
+    for r in $(task_roles); do
+      if [[ -n "$first" ]]; then
+        tmux new-session -d -s "$S" -n srv -c "$(wt_dir "$r")" -e "COMPOSE_PROJECT_NAME=$S"
+        tmux set-environment -t "=$S" COMPOSE_PROJECT_NAME "$S"
+        p=$(tmux display-message -p -t "=$S:srv" '#{pane_id}'); first=""
+      else
+        p=$(tmux split-window -h -d -P -F '#{pane_id}' -t "=$S:srv" -c "$(wt_dir "$r")")
+      fi
+      tmux set-option -p -t "$p" @srv "$r"
+    done
+    [[ -z "$first" ]] || die "task $TASK has no worktrees"
+    tmux select-layout -t "=$S:srv" even-horizontal >/dev/null 2>&1
+    CREATED=1
+  else
+    srv_panes
+  fi
+  touch "$WT_ROOT/$TASK/.open"   # removed by down; still there after a crash or a restart of the Mac
+  watch_start
+  for r in $(all_roles); do # tag agent panes, including those of sessions made by older versions
+    p=$(agent_pane "$r")
+    [[ -n "$p" ]] && tmux set-option -p -t "$p" @agent "$r"
+  done
+  return 0
+}
+
+launch() { # <agent> <fresh|continue>
+  local p name prompt rc="" settings m e
+  name=$(agent_name "$1"); p=$(agent_pane "$1"); prompt=$(printf %q "$WT_ROOT/$TASK/$1.prompt.md")
+  # Remote Control shows the session in the Claude mobile app and on claude.ai/code
+  [[ "$REMOTE" == on ]] && rc="--remote-control $name "
+  m=$(saved_choice "$1" model); e=$(saved_choice "$1" effort)
+  [[ -n "$m" ]] && rc+="--model $m "
+  [[ -n "$e" ]] && rc+="--effort $e "
+  # extra settings for this agent only: hooks that report its state (and notify you), see hook()
+  settings="$WT_ROOT/$TASK/$1.settings.json"
+  hook_settings "$1" > "$settings"
+  rc+="--settings $(printf %q "$settings") "
+  set_state "$1" starting "launched"
+  # continue the agent's last conversation in its worktree; start fresh only when there is none
+  # (not "--continue || fresh": after a crash that would silently throw the conversation away)
+  if [[ "$2" == continue ]] && ls "$CLAUDE_PROJECTS/$(printf '%s' "$(wt_dir "$1")" | sed 's/[^A-Za-z0-9]/-/g')"/*.jsonl >/dev/null 2>&1; then
+    tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG; claude ${rc}--continue --name $name" Enter
+  else
+    tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG; claude ${rc}--name $name \"\$(cat $prompt)\"" Enter
+  fi
+}
+
+attach() {
+  session_exists || die "$S is not running. Start it with: $PROG up $TASK"
+  if [[ -n "${TMUX:-}" ]]; then tmux switch-client -t "=$S"; else tmux attach -t "=$S"; fi
+}
+
+open_view() { # <window|tab|here|detached>: show the task's session (on the agent in FOCUS, if set)
+  local how="$1" cmd="tmux attach -t '=$S'" script p
+  if [[ -n "$FOCUS" ]]; then   # also when detached: the next attach lands on that agent
+    p=$(agent_pane "$FOCUS")
+    [[ -n "$p" ]] && { tmux select-window -t "$p"; tmux select-pane -t "$p"; }
+  fi
+  case "$how" in
+    detached) echo "open it with: $PROG attach $TASK" ;;
+    here)     attach ;;
+    window|tab)
+      if [[ "$(uname -s)" != Darwin ]] || ! command -v osascript >/dev/null; then
+        echo "can't open a new $how here; open it with: $PROG attach $TASK"; return 0
+      fi
+      if [[ -d /Applications/iTerm.app || -d "$HOME/Applications/iTerm.app" ]]; then
+        if [[ "$how" == tab ]]; then
+          script='tell application "iTerm2"
+  activate
+  if (count of windows) > 0 then
+    tell current window to create tab with default profile
+  else
+    create window with default profile
+  end if
+  tell current session of current window to write text "'"$cmd"'"
+end tell'
+        else
+          script='tell application "iTerm2"
+  activate
+  create window with default profile
+  tell current session of current window to write text "'"$cmd"'"
+end tell'
+        fi
+      else
+        how=window   # Terminal.app: always a new window
+        script='tell application "Terminal"
+  activate
+  do script "'"$cmd"'"
+end tell'
+      fi
+      osascript -e "$script" >/dev/null || { echo "couldn't open a new $how; open it with: $PROG attach $TASK"; return 0; }
+      echo "opened $S in a new $how" ;;
+  esac
+}
+
+# ---- commands ----
+
+up() {
+  session_exists && die "$S is already running. Open it with: $PROG attach $TASK, or start an agent with: $PROG start $TASK <agent>"
+  local roles="${ONLY:-be ui}" r
+  ensure_task "$roles" "${GOAL:-Wait for my instructions.}"
+  save_choices "$roles"
+  for r in $roles; do place "$r" "$LAYOUT"; launch "$r" fresh; done
+  echo "started $S (agents: $(csv "$roles"))"
+  open_view "${OPEN:-$DEFAULT_OPEN}"
+}
+
+start() { # ROLES
+  local r
+  ensure_task "$ROLES" ""
+  save_choices "$ROLES"
+  for r in $ROLES; do
+    place "$r" "$LAYOUT"
+    if is_running "$r"; then
+      echo "$(agent_name "$r") is already running${LAYOUT:+ (layout: $LAYOUT)}"
+    else
+      if [[ -n "$FRESH" ]]; then launch "$r" fresh; else launch "$r" continue; fi
+      echo "started $(agent_name "$r") in session $S"
+    fi
+  done
+  if [[ -n "$OPEN" ]]; then open_view "$OPEN"
+  elif [[ -n "$CREATED" ]]; then open_view "$DEFAULT_OPEN"; fi
+}
+
+stop_one() { # <agent>
+  local r="$1" p i
+  p=$(agent_pane "$r")
+  [[ -n "$p" ]] && is_running "$r" || { echo "$(agent_name "$r") is not running"; return 0; }
+  [[ "${TMUX_PANE:-}" == "$p" ]] && die "refusing to stop $(agent_name "$r") from inside itself"
+  date +%s > "$WT_ROOT/$TASK/$r.stopping"           # tells the watchdog this exit is on purpose (hooks may still report idle)
+  tmux send-keys -t "$p" Escape; sleep 0.3          # interrupt the current turn
+  tmux send-keys -t "$p" C-c; sleep 0.3
+  tmux send-keys -t "$p" C-c                        # second Ctrl+C exits Claude Code
+  for i in 1 2 3 4 5 6 7 8 9 10; do is_running "$r" || break; sleep 0.5; done
+  if is_running "$r"; then
+    pkill -TERM -P "$(tmux display-message -p -t "$p" '#{pane_pid}')" 2>/dev/null || true
+    sleep 1
+  fi
+  is_running "$r" && die "could not stop $(agent_name "$r")"
+  set_state "$r" stopped "stopped by $PROG"; rm -f "$WT_ROOT/$TASK/$r.stopping"
+  echo "stopped $(agent_name "$r"). Start it again with: $PROG start $TASK $r"
+}
+stop() { local r; for r in $ROLES; do stop_one "$r"; done; }
+restart() { # stop, then continue the same conversation, with any new --model / --effort
+  local r
+  for r in $ROLES; do stop_one "$r" >/dev/null; done
+  start
+}
+
+resume() {
+  local roles r
+  roles=$(task_roles)
+  [[ -n "$roles" ]] || die "no worktrees for $TASK (pruned?). Start fresh with: $PROG up $TASK"
+  [[ -z "$ONLY" ]] || roles="$ONLY"
+  ensure_task "" ""
+  save_choices "$roles"
+  for r in $roles; do
+    [[ -d "$(wt_dir "$r")" ]] || die "$(agent_name "$r") has no worktree; start it with: $PROG start $TASK $r"
+    place "$r" "$LAYOUT"
+    if ! is_running "$r"; then
+      if [[ -n "$FRESH" ]]; then launch "$r" fresh; else launch "$r" continue; fi
+    fi
+  done
+  open_view "${OPEN:-$DEFAULT_OPEN}"
+}
+
+say() { # ROLES (one agent, a list, or every running agent), message in GOAL
+  local p r sent=""
+  for r in $ROLES; do
+    p=$(agent_pane "$r")
+    if [[ -z "$p" ]] || ! is_running "$r"; then
+      [[ $(count $ROLES) -eq 1 ]] && die "$(agent_name "$r") is not running; start it with: $PROG start $TASK $r"
+      echo "skipped $(agent_name "$r"): not running"; continue
+    fi
+    tmux send-keys -t "$p" -l -- "$GOAL"
+    sleep 0.3
+    tmux send-keys -t "$p" Enter
+    sent+="$r "
+  done
+  [[ -n "$sent" ]] || die "no agent of $TASK is running"
+  echo "sent to: $(csv "${sent% }")"
+}
+
+list() {
+  local s r line found=""
+  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+    use_task "${s#"$PREFIX-"}"; line="$TASK"; found=1
+    for r in $(known_roles); do
+      if is_running "$r"; then
+        line+="  $r: running in window $(tmux display-message -p -t "$(agent_pane "$r")" '#{window_index}:#{window_name}')"
+      else
+        line+="  $r: stopped"
+      fi
+    done
+    echo "$line"
+  done
+  [[ -n "$found" ]] || echo "no $PREFIX-* sessions"
+}
+
+repos() {
+  repo_lines | awk -F'\t' '{ printf "%-8s %-50s %s\n", $1, $2, $3 }'
+  echo "(added repos live in $REPOS_FILE)"
+}
+
+canon() { (cd "$1" 2>/dev/null && pwd -P); }
+path_problem() { # <path>: prints why the repo can't be added, or nothing
+  local p="$1" top r rp
+  [[ -d "$p" ]] || { echo "$p is not a folder"; return; }
+  p=$(canon "$p")
+  top=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null) || { echo "$p is not a git repository"; return; }
+  [[ "$(canon "$top")" == "$p" ]] || { echo "$p is inside $top; pick the repository root"; return; }
+  [[ "$p/" == "$(canon "$WT_ROOT" || echo "$WT_ROOT")/"* ]] && { echo "$p is a task worktree, not a repository"; return; }
+  git -C "$p" remote get-url origin >/dev/null 2>&1 || { echo "$p has no 'origin' remote; task branches start from origin"; return; }
+  for r in $(all_roles); do
+    rp=$(repo_path "$r")
+    [[ "$(canon "$rp" || echo "$rp")" == "$p" ]] && { echo "already added as agent '$r'"; return; }
+    [[ "$(basename "$rp")" == "$(basename "$p")" ]] && { echo "agent '$r' already uses a repo folder named $(basename "$p"); their worktrees would clash"; return; }
+  done
+  return 0
+}
+key_problem() { # <agent name>: prints why it can't be used, or nothing
+  [[ "$1" =~ ^[a-z][a-z0-9]{0,9}$ ]] || { echo "use 1 to 10 lowercase letters or digits, starting with a letter"; return; }
+  [[ "$1" == srv || "$1" == agents ]] && { echo "'$1' is a window name; pick another"; return; }
+  is_role "$1" && { echo "agent '$1' already exists"; return; }
+  return 0
+}
+
+add_repo_cmd() { # <repo name|path> [agent] [description]
+  [[ $# -ge 1 ]] || die "usage: $PROG add-repo <repo name|path> [agent] [\"description\"]"
+  local key
+  if [[ "$1" == */* || "$1" == .* || "$1" == "~"* ]]; then add_repo "${1/#\~/$HOME}" "${2:-$(suggest_key "$(basename "$1")")}" "${3:-}"
+  else key=$(org_add "$@"); load_repos; echo "added agent '$key' for $ORG/$1 at $(repo_path "$key"). Start it with: $PROG start <task> $key"; fi
+}
+add_repo() { # <path> <agent> [description]
+  local p problem desc
+  [[ $# -ge 2 ]] || die "usage: $PROG add-repo <path> <agent> [\"description\"]"
+  problem=$(path_problem "$1"); [[ -z "$problem" ]] || die "$problem"
+  problem=$(key_problem "$2"); [[ -z "$problem" ]] || die "$problem"
+  p=$(canon "$1")
+  desc=$(printf '%s' "${3:-}" | tr '\t\n' '  ')
+  [[ -n "${desc// }" ]] || desc=$(basename "$p")
+  mkdir -p "$ORG_DIR"
+  [[ -f "$REPOS_FILE" ]] || printf '# %s agents of %s: <agent><TAB><repo path><TAB><description>\n' "$PROG" "$ORG" > "$REPOS_FILE"
+  printf '%s\t%s\t%s\n' "$2" "$p" "$desc" >> "$REPOS_FILE"
+  echo "added agent '$2' for $p. Start it with: $PROG start <task> $2"
+}
+
+compose_projects_in() { # <folder>: compose projects whose containers were started from inside it
+  docker ps -a --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null |
+    awk -F'|' -v d="$1/" '$1 != "" && index($2 "/", d) == 1 { print $1 }' | sort -u
+}
+clean_project() { # <compose project>
+  local p="$1" f="label=com.docker.compose.project=$1"
+  docker compose -p "$p" down -v --remove-orphans --rmi local >/dev/null 2>&1 || true
+  { docker ps -aq --filter "$f"      | xargs -r docker rm -f;      } >/dev/null 2>&1 || true
+  { docker volume ls -q --filter "$f"  | xargs -r docker volume rm;  } >/dev/null 2>&1 || true
+  { docker network ls -q --filter "$f" | xargs -r docker network rm; } >/dev/null 2>&1 || true
+}
+docker_clean() { # <compose project> [folder]: that project, plus every project started from inside the folder
+  command -v docker >/dev/null || return 0
+  local p list="$1"
+  [[ -n "${2:-}" ]] && list+=" $(compose_projects_in "$2" | tr '\n' ' ')"
+  for p in $list; do clean_project "$p"; done
+  echo "docker: containers, volumes, networks and local images of $(echo $list | tr ' ' ',') removed"
+}
+
+down() {
+  local r roles dirty; roles=$(known_roles)
+  if [[ -n "$PRUNE" ]]; then   # check every worktree first, so a refusal never leaves half a task behind
+    dirty=$(dirty_roles "$roles")
+    [[ -z "$dirty" ]] || die "not pruning $TASK: uncommitted changes in the worktree of: $dirty. Commit or stash them, or run down without --prune"
+  fi
+  for r in $roles; do
+    pkill -f -- "$(wt_dir "$r")/" 2>/dev/null && echo "$r: dev server processes stopped" || true
+  done
+  docker_clean "$S" "$WT_ROOT/$TASK"
+  if [[ -n "$PRUNE" ]]; then
+    for r in $roles; do   # refuses if there are uncommitted changes
+      [[ -d "$(wt_dir "$r")" ]] && git -C "$(repo_path "$r")" worktree remove "$(wt_dir "$r")"
+    done
+    rm -rf "${WT_ROOT:?}/${TASK:?}"
+    echo "worktrees removed (branches $TASK kept)"
+  fi
+  rm -f "$WT_ROOT/$TASK/.open"
+  for r in $roles; do [[ -d "$WT_ROOT/$TASK" ]] && set_state "$r" stopped "task shut down"; done
+  # last, so running "down" from inside the session still finishes the cleanup first
+  tmux kill-session -t "=$S" 2>/dev/null && echo "tmux: $S killed" || true
+}
+
+dirty_roles() { # <agents>: those whose worktree has uncommitted or untracked changes
+  local r out=""
+  for r in $1; do
+    [[ -d "$(wt_dir "$r")" && -n "$(git -C "$(wt_dir "$r")" status --porcelain 2>/dev/null)" ]] && out+="$r "
+  done
+  echo "${out% }"
+}
+
+remove() { # ROLES: stop the agents and delete their pane, shell, worktree and prompt; the last one takes the task with it
+  local r p dirty rest
+  dirty=$(dirty_roles "$ROLES")
+  [[ -z "$dirty" || -n "$FORCE" ]] ||
+    die "not removing: uncommitted changes in the worktree of: $dirty. Commit or stash them, or add --force to delete them"
+  rest=""; for r in $(known_roles); do in_list "$r" "$ROLES" || rest+="$r "; done
+  if [[ -z "$rest" ]]; then   # nothing left afterwards: shut the whole task down
+    for r in $ROLES; do stop_one "$r" >/dev/null; done
+    [[ -n "$FORCE" ]] && for r in $ROLES; do
+      [[ -d "$(wt_dir "$r")" ]] && git -C "$(repo_path "$r")" worktree remove --force "$(wt_dir "$r")"
+    done
+    PRUNE=1; down; return 0
+  fi
+  for r in $ROLES; do
+    stop_one "$r" >/dev/null
+    [[ "$r" == be ]] || { pkill -f -- "$(wt_dir "$r")/" 2>/dev/null && echo "$r: dev server processes stopped" || true; }
+    if command -v docker >/dev/null; then
+      for p in $(compose_projects_in "$(wt_dir "$r")"); do clean_project "$p"; echo "$r: docker project $p removed"; done
+    fi
+    p=$(agent_pane "$r"); [[ -n "$p" ]] && tmux kill-pane -t "$p"
+    p=$(tmux list-panes -t "=$S:srv" -F '#{@srv} #{pane_id}' 2>/dev/null | awk -v r="$r" '$1 == r { print $2 }')
+    [[ -n "$p" ]] && tmux kill-pane -t "$p"
+    if [[ -d "$(wt_dir "$r")" ]]; then
+      git -C "$(repo_path "$r")" worktree remove ${FORCE:+--force} "$(wt_dir "$r")"
+    fi
+    rm -f "$WT_ROOT/$TASK/$r.prompt.md" "$WT_ROOT/$TASK/$r.state" "$WT_ROOT/$TASK/$r.stopping" "$WT_ROOT/$TASK/$r.restarts" "$WT_ROOT/$TASK/$r.settings.json"
+    echo "removed $(agent_name "$r"): pane, shell and worktree (branch $TASK kept)"
+  done
+  session_exists && { tidy; tmux select-layout -t "=$S:srv" even-horizontal >/dev/null 2>&1 || true; }
+  return 0
+}
+
+notify() { # <task> <agent> (older agents pass their session name only): Claude Code's Notification hook calls this
+  local input msg title sub="" goal n
+  input=$(cat)
+  if command -v jq >/dev/null; then msg=$(jq -r '.message // empty' <<< "$input" 2>/dev/null || true)
+  else msg=$(sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' <<< "$input" | head -n 1); fi
+  if [[ $# -ge 2 ]] && is_role "$2"; then
+    use_task "$1"
+    title="$1 · $(repo_desc "$2") needs you"
+    goal=$(cat "$WT_ROOT/$1/goal" 2>/dev/null || true)
+    case "$goal" in
+      ""|"Wait for my instructions."|"Wait for instructions.") ;;
+      "Work on GitHub issue "*)   # "…/issues/123: Title" becomes "#123 Title"
+        n=$(sed -E -n 's#^Work on GitHub issue [^ ]*/issues/([0-9]+):.*#\1#p' <<< "$goal")
+        sub="#$n ${goal#*: }" ;;
+      *) sub="$goal" ;;
+    esac
+    [[ ${#sub} -le 90 ]] || sub="${sub:0:87}..."
+  else
+    title="${1:-agent} needs you"
+  fi
+  command -v osascript >/dev/null || return 0
+  osascript - "$title" "$sub" "${msg:-needs your attention}" >/dev/null 2>&1 <<'EOF' || true
+on run argv
+  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv) sound name "Glass"
+end run
+EOF
+}
+
+# ---- pull requests: fetched in the background (gh is slow), read from a cache ----
+
+gh_slug() { # <repo path>: owner/name of its GitHub origin
+  git -C "$1" remote get-url origin 2>/dev/null | sed -E -n 's#^.*github\.com[:/](.+)$#\1#p' | sed 's/\.git$//'
+}
+pr_refresh() { # writes $ORG_CACHE/prs.tsv: agent, branch, number, state, checks
+  command -v gh >/dev/null && command -v jq >/dev/null || return 0
+  mkdir -p "$ORG_CACHE"
+  local lock="$ORG_CACHE/prs.lock" tmp i dir slug used=" "
+  find "$lock" -maxdepth 0 -mmin +10 -exec rmdir {} \; 2>/dev/null || true   # a refresh that died long ago
+  mkdir "$lock" 2>/dev/null || return 0                                      # another refresh is running
+  tmp=$(mktemp "$ORG_CACHE/prs.XXXXXX")
+  for dir in "$WT_ROOT"/*/*/; do used+="$(basename "$dir") "; done 2>/dev/null   # only repos that tasks use
+  for i in "${!R_KEYS[@]}"; do
+    in_list "$(basename "${R_PATHS[$i]}")" "$used" || continue
+    slug=$(gh_slug "${R_PATHS[$i]}"); [[ -n "$slug" ]] || continue
+    gh pr list -R "$slug" --author @me --state all --limit 40 --json headRefName,number,state,statusCheckRollup 2>/dev/null |
+      jq -r --arg k "${R_KEYS[$i]}" '.[] | [$k, .headRefName, .number, .state,
+        ([.statusCheckRollup[]? | (.conclusion // .state // "")] as $c
+         | if ($c | length) == 0 then "none"
+           elif any($c[]; . == "FAILURE" or . == "ERROR" or . == "CANCELLED" or . == "TIMED_OUT" or . == "ACTION_REQUIRED") then "fail"
+           elif all($c[]; . == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED") then "pass"
+           else "pending" end)] | @tsv' >> "$tmp" 2>/dev/null || true
+  done
+  mv "$tmp" "$ORG_CACHE/prs.tsv"
+  rmdir "$lock" 2>/dev/null || true
+}
+pr_refresh_if_old() { # starts a background refresh when the cache is missing or older than PR_TTL_MIN
+  local f="$ORG_CACHE/prs.tsv"
+  [[ -f "$f" && -n "$(find "$f" -mmin -"$PR_TTL_MIN" 2>/dev/null)" ]] && return 0
+  ( "$SELF" _prs >/dev/null 2>&1 & ) >/dev/null 2>&1
+  return 0
+}
+pr_of() { # <agent> <branch>: "number state checks" of its newest pull request (open ones first), or nothing
+  [[ -f "$ORG_CACHE/prs.tsv" ]] || return 0
+  awk -F'\t' -v k="$1" -v b="$2" '$1 == k && $2 == b {
+      rank = ($4 == "OPEN") ? 3 : ($4 == "MERGED") ? 2 : 1
+      if (rank > br || (rank == br && $3 > bn)) { br = rank; bn = $3; out = $3 " " $4 " " $5 } }
+    END { if (out != "") print out }' "$ORG_CACHE/prs.tsv"
+}
+task_merged() { # <task>: true when every worktree of the task has a merged pull request and no uncommitted changes
+  local r pr roles
+  use_task "$1"; roles=$(task_roles)
+  [[ -n "$roles" ]] || return 1
+  for r in $roles; do   # agents may switch branches, so look at the branch the worktree is on now
+    pr=$(pr_of "$r" "$(git -C "$(wt_dir "$r")" branch --show-current 2>/dev/null)"); [[ "$pr" == *" MERGED "* ]] || return 1
+  done
+  [[ -z "$(dirty_roles "$roles")" ]]
+}
+merged_tasks() { local t out=""; for t in $(all_tasks); do task_merged "$t" && out+="$t "; done; echo "${out% }"; }
+
+# ---- tokens, model, effort and cost per agent, read from Claude Code's session transcripts ----
+# Cost is what the tokens would cost at Anthropic's API list prices (USD per million tokens:
+# input, output, cache read; cache writes are 1.25x input for the 5-minute cache, 2x for the
+# 1-hour cache; fast mode doubles everything). It is an estimate, not your bill: a Claude
+# subscription covers usage up to its limits. Override or add prices in $CONFIG_DIR/prices.json,
+# for example {"claude-opus-5-5": [4, 20, 0.2]}.
+PRICES_DEFAULT='{
+  "claude-fable-5-2": [8, 40, 0.2],   "claude-mythos-5-2": [8, 40, 0.2],
+  "claude-fable-5-1": [10, 50, 0.25], "claude-mythos-5-1": [10, 50, 0.25],
+  "claude-fable-5": [10, 50, 1],      "claude-mythos-5": [10, 50, 1],
+  "claude-opus-5-5": [4, 20, 0.2],    "claude-opus-5": [5, 25, 0.5],
+  "claude-opus-4-8": [5, 25, 0.5],    "claude-opus-4-7": [5, 25, 0.5],    "claude-opus-4-6": [5, 25, 0.5],
+  "claude-sonnet-5-5": [2, 10, 0.1],  "claude-sonnet-5": [2, 10, 0.2],    "claude-sonnet-4-6": [3, 15, 0.3],
+  "claude-haiku-5-5": [0.1, 0.5, 0.01], "claude-haiku-4-5": [1, 5, 0.1]
+}'
+# One transcript -> "usd<TAB>tokens<TAB>replies without a price<TAB>last model<TAB>last effort<TAB>last time".
+# Claude Code writes one line per content block, so a reply is counted once by its message id.
+JQ_USAGE='
+def base: sub("-[0-9]{8}$"; "");
+def cost: (.message.model | base) as $k | $P[$k] as $r
+  | if $r == null then null else
+      .message.usage as $u
+      | (if ($u.speed // "standard") == "fast" then 2 else 1 end) as $f
+      | ($u.cache_creation.ephemeral_1h_input_tokens // 0) as $w1
+      | (($u.cache_creation_input_tokens // 0) - $w1) as $w5
+      | ((($u.input_tokens // 0) * $r[0] + $w5 * $r[0] * 1.25 + $w1 * $r[0] * 2
+          + ($u.cache_read_input_tokens // 0) * $r[2] + ($u.output_tokens // 0) * $r[1]) * $f / 1000000)
+    end;
+[inputs | select(.type == "assistant" and .message.usage != null and (.message.model // "<synthetic>") != "<synthetic>")]
+| unique_by(.message.id // .uuid)
+| sort_by(.timestamp // "")
+| [ (map(cost // 0) | add // 0),
+    (map(.message.usage | (.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0) + (.output_tokens // 0)) | add // 0),
+    (map(select(cost == null)) | length),
+    (last.message.model // "-" | base),
+    (map(select(.effort != null)) | last.effort // "-"),
+    (last.timestamp // "-") ]
+| @tsv'
+PRICES=""
+prices_json() { # the default prices, with $CONFIG_DIR/prices.json on top
+  if [[ -z "$PRICES" ]]; then
+    PRICES=$(jq -c -n --argjson d "$PRICES_DEFAULT" --slurpfile o <(cat "$CONFIG_DIR/prices.json" 2>/dev/null || echo '{}') '$d * ($o[0] // {})' 2>/dev/null) ||
+      PRICES=$(jq -c -n --argjson d "$PRICES_DEFAULT" '$d')
+  fi
+  printf '%s' "$PRICES"
+}
+agent_usage() { # <worktree>: "<usd> <tokens> <replies without a price> <model> <effort>" over all its sessions and subagents
+  local pdir f st c line u t k m e lt usd=0 tok=0 unk=0 model=- effort=- ts=""
+  command -v jq >/dev/null || { echo "0 0 0 - -"; return 0; }
+  pdir="$CLAUDE_PROJECTS/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+  [[ -d "$pdir" ]] || { echo "0 0 0 - -"; return 0; }
+  mkdir -p "$CACHE_DIR/usage"
+  while IFS= read -r f; do
+    st=$(stat -f '%m:%z' "$f" 2>/dev/null) || continue
+    c="$CACHE_DIR/usage/$(md5 -q -s "$f")"   # a transcript is read again only when it changed
+    if [[ -f "$c" && "$(head -n 1 "$c")" == "$st" ]]; then line=$(sed -n 2p "$c")
+    else
+      line=$(jq -rn --argjson P "$(prices_json)" "$JQ_USAGE" < "$f" 2>/dev/null || true)
+      printf '%s\n%s\n' "$st" "$line" > "$c"
+    fi
+    [[ -n "$line" ]] || continue
+    IFS=$'\t' read -r u t k m e lt <<< "$line"
+    usd=$(awk -v a="$usd" -v b="$u" 'BEGIN { printf "%.6f", a + b }')
+    tok=$((tok + t)); unk=$((unk + k))
+    if [[ "$f" != */subagents/* && "$lt" > "$ts" ]]; then ts="$lt"; model="$m"; effort="$e"; fi
+  done < <(find "$pdir" -name '*.jsonl' -type f 2>/dev/null)
+  echo "$usd $tok $unk $model $effort"
+}
+usd_rate() { # today's USD to $CURRENCY rate (AA_USD_RATE overrides), cached for a day; nothing when unknown or USD
+  local f="$CACHE_DIR/usd-$CURRENCY" r
+  [[ "$CURRENCY" != USD ]] || return 0
+  if [[ -n "${AA_USD_RATE:-}" ]]; then echo "$AA_USD_RATE"; return 0; fi
+  if [[ -s "$f" && -n "$(find "$f" -mtime -1 2>/dev/null)" ]]; then cat "$f"; return 0; fi
+  r=$(curl -s -m 3 'https://open.er-api.com/v6/latest/USD' 2>/dev/null | jq -r --arg c "$CURRENCY" '.rates[$c] // empty' 2>/dev/null || true)
+  if [[ "$r" =~ ^[0-9.]+$ ]]; then mkdir -p "$CACHE_DIR"; echo "$r" > "$f"; echo "$r"
+  elif [[ -s "$f" ]]; then cat "$f"; fi   # yesterday's rate beats none
+  return 0
+}
+money() { # <usd> <rate or nothing>: "CHF 12.40" in your currency, or "USD 14.70" without a rate
+  if [[ -n "${2:-}" ]]; then awk -v u="$1" -v r="$2" -v c="$CURRENCY" 'BEGIN { printf "%s %.2f", c, u * r }'
+  else awk -v u="$1" 'BEGIN { printf "USD %.2f", u }'; fi
+}
+tokens_short() { awk -v t="$1" 'BEGIN { if (t >= 1e9) printf "%.1fB", t / 1e9; else if (t >= 1e6) printf "%.1fM", t / 1e6; else if (t >= 1e3) printf "%.0fk", t / 1e3; else printf "%d", t }'; }
+model_short() { # claude-opus-5-5 -> Opus 5.5
+  [[ "$1" == - || -z "$1" ]] && { echo "-"; return 0; }
+  echo "${1#claude-}" | awk -F- '{ name = toupper(substr($1, 1, 1)) substr($1, 2); v = $2; for (i = 3; i <= NF; i++) v = v "." $i; print name (v == "" ? "" : " " v) }'
+}
+
+# ---- skills, plugins and MCP servers: what is available, and what each agent used ----
+# Inventory rows: "kind<TAB>name<TAB>where it comes from<TAB>ref"; ref tells the detail view where to look.
+# MCP servers are read from config files, never started, and their secrets (env, headers) are never shown.
+
+skill_desc() { # <SKILL.md>: its one-line description
+  sed -n '/^---$/,/^---$/{s/^description: *//p;}' "$1" 2>/dev/null | head -n 1 | sed 's/^["'"'"']//; s/["'"'"']$//'
+}
+mcp_names() { # <json file> [jq path to the servers object]: server names in it
+  jq -r "(${2:-.mcpServers // .}) | if type == \"object\" then keys[] else empty end" "$1" 2>/dev/null || true
+}
+inventory() { # every skill, plugin and MCP server an agent could use: "kind<TAB>name<TAB>where<TAB>ref<TAB>level"
+  # level: global (your own setup in ~/.claude), org (managed by or synced from your claude.ai organisation),
+  # repo (comes with one of the organisation's repositories)
+  local plugins id inst en scope proj pname d n i dir lvl where repos
+  plugins=$(with_timeout 15 claude plugin list --json 2>/dev/null || echo '[]')
+  repos=$(printf '%s\n' "${R_PATHS[@]+"${R_PATHS[@]}"}" | jq -R . | jq -sc 'map(select(. != ""))')
+  while IFS=$'\t' read -r id inst en scope proj; do
+    [[ -n "$id" ]] || continue
+    pname="${id%@*}"
+    case "$scope" in
+      user)           lvl=global; where="" ;;
+      managed)        lvl=org; where="managed by your organisation" ;;
+      synced)         lvl=org; where="synced from claude.ai" ;;
+      *)              lvl=repo; where="repo $(basename "$proj")" ;;
+    esac
+    printf 'plugin\t%s\t%s\tplugin|%s\t%s\n' "$pname" "$([[ "$en" == true ]] && echo on || echo off)${where:+, $where}" "$inst" "$lvl"
+    [[ "$en" == true ]] || continue
+    for d in "$inst"/skills/*/SKILL.md; do [[ -f "$d" ]] && printf 'skill\t%s:%s\tplugin %s\tskill|%s\t%s\n' "$pname" "$(basename "$(dirname "$d")")" "$pname" "$d" "$lvl"; done
+    [[ -f "$inst/.mcp.json" ]] && while IFS= read -r n; do [[ -n "$n" ]] && printf 'mcp\t%s\tplugin %s\tmcp|%s|%s\t%s\n' "$n" "$pname" "$inst/.mcp.json" "$n" "$lvl"; done < <(mcp_names "$inst/.mcp.json")
+    [[ -f "$inst/.claude-plugin/plugin.json" ]] && while IFS= read -r n; do [[ -n "$n" ]] && printf 'mcp\t%s\tplugin %s\tmcp|%s|%s\t%s\n' "$n" "$pname" "$inst/.claude-plugin/plugin.json" "$n" "$lvl"; done < <(mcp_names "$inst/.claude-plugin/plugin.json" '.mcpServers // {}')
+  done < <(jq -r --argjson repos "$repos" '.[]
+                    | select((.scope != "local" and .scope != "project") or ((.projectPath // "") as $p | $p != "" and ($repos | any(.[]; . == $p))))   # other folders: not ours
+                    | [.id, .installPath, (.enabled | tostring), .scope, .projectPath] | map(if (. // "") == "" then "-" else . end)   # read collapses empty tab fields
+                    | @tsv' <<< "$plugins" 2>/dev/null)
+  for d in "$HOME"/.claude/skills/*/SKILL.md; do [[ -f "$d" ]] && printf 'skill\t%s\t~/.claude/skills\tskill|%s\tglobal\n' "$(basename "$(dirname "$d")")" "$d"; done
+  while IFS= read -r n; do [[ -n "$n" ]] && printf 'mcp\t%s\t~/.claude.json\tmcp|%s|%s\tglobal\n' "$n" "$HOME/.claude.json" "$n"; done < <(mcp_names "$HOME/.claude.json" '.mcpServers // {}')
+  for i in "${!R_KEYS[@]}"; do   # what each repo brings along (worktrees have the same files)
+    dir="${R_PATHS[$i]}"
+    for d in "$dir"/.claude/skills/*/SKILL.md; do [[ -f "$d" ]] && printf 'skill\t%s\trepo %s\tskill|%s\trepo\n' "$(basename "$(dirname "$d")")" "$(basename "$dir")" "$d"; done
+    [[ -f "$dir/.mcp.json" ]] && while IFS= read -r n; do [[ -n "$n" ]] && printf 'mcp\t%s\trepo %s\tmcp|%s|%s\trepo\n' "$n" "$(basename "$dir")" "$dir/.mcp.json" "$n"; done < <(mcp_names "$dir/.mcp.json")
+  done
+  return 0
+}
+LEVELS="global org repo" CLAUDE_ORG=""
+level_tag() { # <level>: a fixed-width coloured tag
+  case "$1" in
+    global) printf '%s' "${C_CYAN}global${C_RESET}" ;;
+    org)    printf '%s' "${C_YELLOW}org   ${C_RESET}" ;;
+    repo)   printf '%s' "${C_GREEN}repo  ${C_RESET}" ;;
+    *)      printf '%s' "${C_DIM}built-in${C_RESET}" ;;
+  esac
+}
+level_title() { # <level>: the heading of its group
+  case "$1" in
+    global) echo "Global · your own setup in ~/.claude, in every repo" ;;
+    org)    echo "Organisation · ${CLAUDE_ORG:-your claude.ai organisation}: managed, synced and claude.ai connectors" ;;
+    repo)   echo "Repositories · what the repositories of $ORG bring along" ;;
+  esac
+}
+level_of_used() { # <inventory> <kind> <name>: the level of something an agent used that isn't on disk
+  case "$2:$3" in
+    mcp:claude_ai_*) echo org ;;
+    *:*:*|mcp:plugin_*)   # from a plugin: the plugin's level
+      awk -F'\t' -v p="$( [[ "$2" == mcp ]] && echo "${3#plugin_}" | cut -d_ -f1 || echo "${3%%:*}")" '$1 == "plugin" && $2 == p { print $5; exit }' <<< "$1" ;;
+  esac
+}
+
+# One transcript -> "kind<TAB>name<TAB>times" for skills (Skill tool), MCP servers (mcp__server__tool),
+# subagents (Agent tool) and slash commands typed into the session.
+JQ_TOOLS='
+[inputs
+ | ( select(.type == "assistant") | .message.content[]? | select(type == "object" and .type == "tool_use")
+     | { id: .id,
+         k: (if .name == "Skill" then "skill" elif (.name | startswith("mcp__")) then "mcp" elif (.name == "Agent" or .name == "Task") then "agent" else "" end),
+         n: (if .name == "Skill" then (.input.skill // "?") elif (.name | startswith("mcp__")) then (.name | split("__")[1]) else (.input.subagent_type // "general-purpose") end) } ),
+   ( select(.type == "user") | .message.content
+     | (if type == "string" then . else ([.[]? | select(type == "object") | .text? // empty] | join(" ")) end)
+     | [scan("<command-name>/?([^<]+)</command-name>")[0]] | .[] | { id: null, k: "command", n: . } )
+]
+| map(select(.k != ""))
+| ((map(select(.id != null)) | unique_by(.id)) + map(select(.id == null)))
+| group_by([.k, .n]) | .[] | [.[0].k, .[0].n, length] | @tsv'
+agent_tools() { # <worktree>: "kind<TAB>name<TAB>times" summed over all its sessions and subagents
+  local pdir f st c
+  command -v jq >/dev/null || return 0
+  pdir="$CLAUDE_PROJECTS/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+  [[ -d "$pdir" ]] || return 0
+  mkdir -p "$CACHE_DIR/tools"
+  while IFS= read -r f; do
+    st=$(stat -f '%m:%z' "$f" 2>/dev/null) || continue
+    c="$CACHE_DIR/tools/$(md5 -q -s "$f")"
+    if [[ ! -f "$c" || "$(head -n 1 "$c")" != "$st" ]]; then
+      { echo "$st"; jq -rn "$JQ_TOOLS" < "$f" 2>/dev/null || true; } > "$c"
+    fi
+    tail -n +2 "$c"
+  done < <(find "$pdir" -name '*.jsonl' -type f 2>/dev/null) |
+    awk -F'\t' 'NF == 3 { n[$1 FS $2] += $3 } END { for (k in n) print k FS n[k] }' | sort -t$'\t' -k3,3nr
+}
+tool_source() { # <kind> <name>: where a used item comes from, when the name tells
+  case "$1:$2" in
+    mcp:claude_ai_*) echo "claude.ai connector" ;;
+    mcp:plugin_*)    echo "plugin $(echo "${2#plugin_}" | cut -d_ -f1)" ;;
+    skill:*:*)       echo "plugin ${2%%:*}" ;;
+    agent:*:*)       echo "plugin ${2%%:*}" ;;
+    *) echo "" ;;
+  esac
+}
+inv_preview() { # <ref>: details for one row; never prints MCP env vars or headers
+  local kind="${1%%|*}" rest="${1#*|}" f name d
+  case "$kind" in
+    skill)
+      printf '%s\n\n%s\n\n' "${C_BOLD}$(basename "$(dirname "$rest")")${C_RESET}" "$(skill_desc "$rest")"
+      printf '%s\n' "${C_DIM}${rest/#$HOME/~}${C_RESET}"; echo
+      awk 'f >= 2 { print } /^---$/ { f++ }' "$rest" 2>/dev/null | head -n 60 ;;
+    plugin)
+      f="$rest/.claude-plugin/plugin.json"
+      printf '%s\n' "${C_BOLD}$(jq -r '.name // empty' "$f" 2>/dev/null) $(jq -r '.version // empty' "$f" 2>/dev/null)${C_RESET}"
+      jq -r '.description // empty' "$f" 2>/dev/null; echo
+      for d in skills commands agents; do
+        [[ -d "$rest/$d" ]] && printf '%s: %s\n' "$d" "$(ls "$rest/$d" | sed 's/\.md$//' | paste -sd, - | sed 's/,/, /g')"
+      done
+      name=$( { [[ -f "$rest/.mcp.json" ]] && mcp_names "$rest/.mcp.json"; [[ -f "$f" ]] && mcp_names "$f" '.mcpServers // {}'; } | paste -sd, - | sed 's/,/, /g')
+      [[ -n "$name" ]] && echo "MCP servers: $name"; true ;;
+    mcp)
+      f="${rest%%|*}"; name="${rest#*|}"
+      printf '%s\n\n' "${C_BOLD}$name${C_RESET}"
+      jq -r --arg n "$name" '((.mcpServers // .)[$n]) // {} |
+        "transport: \(.type // (if .url then "http" else "stdio" end))",
+        (if .url then "url: \(.url | sub("\\?.*$"; ""))" else "command: \(.command // "?") (\(.args // [] | length) arguments)" end)' "$f" 2>/dev/null
+      printf '\n%s\n' "${C_DIM}defined in ${f/#$HOME/~}; env and headers are not shown${C_RESET}" ;;
+    head)
+      printf '%s\n\n' "${C_BOLD}$(level_title "$rest")${C_RESET}"
+      case "$rest" in
+        global) echo "Plugins you installed for yourself, skills in ~/.claude/skills and MCP servers in ~/.claude.json. Every agent in every repository gets them." ;;
+        org)    echo "Plugins your claude.ai organisation manages or syncs to you, and its claude.ai connectors. Your organisation's admins decide these; connectors show up once an agent used one." ;;
+        repo)   echo "Skills (.claude/skills), MCP servers (.mcp.json) and plugins that belong to one repository. Only that repository's agent gets them." ;;
+      esac ;;
+    connector) printf '%s\n\n%s\n' "${C_BOLD}${rest#claude_ai_}${C_RESET}" "A claude.ai connector, set up in your claude.ai account. Its settings are not stored on this Mac." ;;
+    *) echo "Built into Claude Code, or no details found." ;;
+  esac
+}
+
+# ---- monitor: what every agent is doing right now, from the end of its newest session file ----
+# activity_of prints "kind<TAB>text<TAB>time": kind is tool (a tool call that hasn't returned yet),
+# thinking (Claude works on a tool result or your message), said (its turn ended with this text).
+JQ_ACTIVITY='
+def line: tostring | gsub("[\r\n\t]+"; " ") | .[0:160];
+def rel: if type == "string" then (if startswith($wt + "/") then .[($wt | length) + 1:] else . end) else "" end;
+def tool:
+  if .name == "Bash" then "Bash: " + ((.input.description // .input.command // "") | line)
+  elif (.name == "Edit" or .name == "Write" or .name == "MultiEdit" or .name == "Read" or .name == "NotebookEdit") then .name + ": " + (.input.file_path | rel)
+  elif (.name == "Grep" or .name == "Glob") then .name + ": " + ((.input.pattern // "") | line)
+  elif .name == "Skill" then "Skill: " + (.input.skill // "")
+  elif (.name == "Agent" or .name == "Task") then "Subagent: " + ((.input.description // .input.subagent_type // "") | line)
+  elif .name == "SendMessage" then "Message to " + ((.input.to // "") | line)
+  elif .name == "WebFetch" then "Reading " + ((.input.url // "") | line)
+  elif .name == "WebSearch" then "Searching: " + ((.input.query // "") | line)
+  elif (.name | startswith("mcp__")) then (.name | split("__") | .[1] + ": " + .[2])
+  else .name end;
+[inputs | select(.type == "assistant" or .type == "user") | select(.isSidechain != true)] as $all
+| ($all | last) as $l
+| if $l == null then empty
+  elif $l.type == "assistant" then
+    # one reply is written as one line per content block: look at all lines of the newest reply
+    [$all[] | select(.type == "assistant" and .message.id == $l.message.id) | .message.content[]? | select(type == "object")] as $b
+    | ([$b[] | select(.type == "tool_use")] | last) as $t
+    | if $t != null then ["tool", ($t | tool), $l.timestamp]
+      else ["said", ([$b[] | select(.type == "text") | .text] | join(" ") | line), $l.timestamp] end
+  else
+    ([$l.message.content] | flatten | map(select(type == "object" and .type == "tool_result")) | length) as $r
+    | if $r > 0 then ["thinking", "working on the result", $l.timestamp]
+      else ["thinking", "reading: " + ([$l.message.content] | flatten | map(if type == "string" then . elif .type == "text" then .text else "" end) | join(" ") | line), $l.timestamp] end
+  end
+| @tsv'
+activity_of() { # <worktree>: what its agent is doing, from the newest main session file
+  local pdir f
+  pdir="$CLAUDE_PROJECTS/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+  f=$(ls -t "$pdir"/*.jsonl 2>/dev/null | head -n 1)
+  [[ -n "$f" ]] || return 0
+  tail -n 400 "$f" | jq -rn --arg wt "$1" "$JQ_ACTIVITY" 2>/dev/null || true
+}
+age_of_epoch() { age_of "$(date -u -r "$1" +%Y-%m-%dT%H:%M:%S)"; }
+age_of() { # <ISO time>: "now", "4m", "2h", "3d"
+  local t0 s
+  t0=$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "${1%%.*}" +%s 2>/dev/null) || { echo ""; return 0; }
+  s=$(( $(date +%s) - t0 ))
+  if [[ $s -lt 60 ]]; then echo now; elif [[ $s -lt 3600 ]]; then echo "$((s / 60))m"
+  elif [[ $s -lt 86400 ]]; then echo "$((s / 3600))h"; else echo "$((s / 86400))d"; fi
+}
+git_counts_cached() { # <worktree>: git_counts, reused for 15 seconds (the Monitor refreshes every 3)
+  local c
+  c="$CACHE_DIR/git/$(md5 -q -s "$1")"
+  mkdir -p "$CACHE_DIR/git"
+  if [[ -s "$c" && -n "$(find "$c" -mtime -15s 2>/dev/null)" ]]; then cat "$c"; else git_counts "$1" | tee "$c"; fi
+}
+MON_RATE=""
+monitor_lines() { # [raw]: one row per open task with its numbers, its agents indented below it; tasks that need you first
+  # raw gives "state<TAB>agent<TAB>age<TAB>usd" per agent, for the header
+  local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop ch prs tusd ttok models a b br
+  [[ "${1:-}" == raw ]] || MON_RATE=$(usd_rate)
+  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+    use_task "${s#"$PREFIX-"}"
+    trank=9; n_need=0; n_work=0; n_idle=0; n_stop=0; ch=0; prs=""; tusd=0; ttok=0; models=""
+    for r in $(known_roles); do
+      st=$(agent_state "$r"); kind=""; text=""; ts=""; age=""
+      [[ "$st" == stopped ]] || IFS=$'\t' read -r kind text ts <<< "$(activity_of "$(wt_dir "$r")")"
+      [[ -n "$ts" ]] && age=$(age_of "$ts")
+      u=0; tk=0; k=0; m=-; e=-
+      [[ -d "$(wt_dir "$r")" ]] && read -r u tk k m e <<< "$(agent_usage "$(wt_dir "$r")")"
+      raw+="$st$TAB$(agent_name "$r")$TAB$age$TAB$u"$'\n'
+      [[ "${1:-}" == raw ]] && continue
+      case "$st" in
+        needs-you) rank=1; n_need=$((n_need + 1)); read_state "$r"
+                   if [[ "$ST" == needs-you && -n "$ST_D" ]]; then text="wants to run: ${ST_D% \[reminded\]}"; age=$(age_of_epoch "$ST_T")
+                   elif [[ "$kind" == tool ]]; then text="wants to run: $text"; fi
+                   text="${C_YELLOW}$text${C_RESET}" ;;
+        working)   rank=2; n_work=$((n_work + 1)) ;;
+        idle)      rank=3; n_idle=$((n_idle + 1)); [[ "$kind" == said ]] && text="said: $text"; text="${C_DIM}$text${C_RESET}" ;;
+        crashed)   rank=1; n_stop=$((n_stop + 1)); text="${C_RED}stopped unexpectedly; start it from its actions${C_RESET}"; age="" ;;
+        *)         rank=4; n_stop=$((n_stop + 1)); text=""; age="" ;;
+      esac
+      [[ $rank -lt $trank ]] && trank=$rank
+      info=""
+      if [[ "${tk:-0}" -gt 0 ]]; then
+        info="$(model_short "$m")$([[ "$e" != - ]] && echo " $e" || true) · $(money "$u" "$MON_RATE")"
+        models+="$r|$(model_short "$m")$([[ "$e" != - ]] && echo " $e" || true)"$'\n'
+      fi
+      tusd=$(awk -v x="$tusd" -v y="$u" 'BEGIN { printf "%.6f", x + y }'); ttok=$((ttok + ${tk:-0}))
+      if [[ -d "$(wt_dir "$r")" ]]; then
+        a=0; b=0; br="$TASK"; read -r a b br <<< "$(git_counts_cached "$(wt_dir "$r")")"
+        ch=$((ch + ${a:-0})); prs+=$(pr_label "$r" "$br" "${b:-0}")
+      fi
+      rows+="$TASK$TAB$rank$TAB$TASK|$r$TAB      $(dot "$r" word "$st") $(printf '%-4s' "$age") ${C_DIM}$(printf '%-24s' "$info")${C_RESET} $text"$'\n'
+    done
+    [[ "${1:-}" == raw ]] && continue
+    head="${C_BOLD}$TASK${C_RESET}  "
+    [[ $n_need -gt 0 ]] && head+="${C_YELLOW}${C_BOLD}◆ $n_need $([[ $n_need -eq 1 ]] && echo needs || echo need) you${C_RESET}  "
+    [[ $n_work -gt 0 ]] && head+="${C_GREEN}● $n_work working${C_RESET}  "
+    [[ $n_idle -gt 0 ]] && head+="${C_CYAN}●${C_RESET} $n_idle idle  "
+    [[ $n_stop -gt 0 ]] && head+="${C_DIM}○ $n_stop stopped${C_RESET}  "
+    head+="${C_DIM}·${C_RESET} $(plural "$ch" "changed file")"
+    [[ $ttok -gt 0 ]] && head+=" · $(tokens_short "$ttok") tokens · ${C_BOLD}$(money "$tusd" "$MON_RATE")${C_RESET} · ${C_DIM}$(model_list "$models")${C_RESET}"
+    head+="$prs"
+    rows+="$TASK${TAB}0$TAB$TASK|$TAB$head"$'\n'
+    rows=$(printf '%s' "$rows" | sed "s/^$TASK$TAB/$trank$TAB$TASK$TAB/")$'\n'
+  done
+  if [[ "${1:-}" == raw ]]; then printf '%s' "$raw"; return 0; fi
+  # tasks by their most urgent agent, then by name; inside a task its own row first, then its agents
+  printf '%s\n' "$BACK_LINE"
+  printf '%s' "$rows" | grep . | sort -s -t"$TAB" -k1,1n -k2,2 -k3,3n | cut -f4-
+}
+
+# ---- GitHub issues for "New task from a GitHub issue" ----
+
+issue_lines() { # open issues as "url<TAB>label": of ISSUE_REPO when set, else of every repository of $ORG
+  local who='\(if (.assignees | length) > 0 then "   · " + ([.assignees[].login] | join(", ")) else "" end)'
+  if [[ -n "$ISSUE_REPO" ]]; then
+    with_timeout 20 gh issue list -R "$ISSUE_REPO" --state open --limit 300 --json url,number,title,assignees \
+      --jq ".[] | \"\(.url)\t#\(.number)  \(.title)$who\""
+  else
+    with_timeout 20 gh search issues --owner "$ORG" --state open --sort updated --limit 300 --json url,number,title,assignees,repository \
+      --jq ".[] | \"\(.url)\t\(.repository.name) #\(.number)  \(.title)$who\""
+  fi
+}
+issues_where() { echo "${ISSUE_REPO:-every repository of $ORG}"; }
+issue_task_name() { # <number> <title>: "1234-short-words-from-the-title", a valid task and branch name
+  local slug
+  slug=$(printf '%s' "$2" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' |
+    awk -F- '{ out = ""; for (i = 1; i <= NF; i++) { if (length(out) + length($i) + 1 > 40) break; out = out (out == "" ? "" : "-") $i } print out }')
+  echo "$1${slug:+-$slug}"
+}
+
+# ---- live refresh: fzf listens on a private socket, a small loop posts an action to it ----
+
+ticker() { # <socket> <seconds> <fzf action>: repeats the action until fzf is gone
+  local sock="$1" secs="$2" action="$3" i=0
+  exec >/dev/null 2>&1 </dev/null
+  sleep 0.3   # let fzf open its socket
+  while [[ -S "$sock" && $i -lt 5000 ]]; do
+    curl -s -m 5 --unix-socket "$sock" -H "x-api-key: ${FZF_API_KEY:-}" -X POST http://localhost -d "$action" || exit 0
+    i=$((i + 1)); sleep "$secs"
+  done
+}
+feed() { # <socket> <seconds> <fzf action with @@> <command...>: runs the command, then hands fzf its finished output
+  # (@@ becomes "cat <file>"), so fzf never waits on a slow refresh and refreshes never pile up
+  local sock="$1" secs="$2" action="$3" out i=0; shift 3
+  exec >/dev/null 2>&1 </dev/null
+  out="$sock.$RANDOM.out"
+  sleep 0.3   # let fzf open its socket
+  while [[ -S "$sock" && $i -lt 5000 ]]; do
+    if "$@" > "$out.tmp" 2>/dev/null && mv "$out.tmp" "$out"; then
+      curl -s -m 5 --unix-socket "$sock" -H "x-api-key: ${FZF_API_KEY:-}" -X POST http://localhost -d "${action//@@/cat '$out'}" || break
+    fi
+    i=$((i + 1)); sleep "$secs"
+  done
+  rm -f "$out" "$out.tmp"
+}
+live_feed() { # <seconds> <fzf action with @@> <command> [...]: sets LIVE to fzf arguments that feed it the command's output
+  local sock="${NOTES:-${TMPDIR:-/tmp}/$PROG}.$$.$RANDOM.sock" cmd=""
+  while [[ $# -ge 3 ]]; do cmd+="$SELF _feed '$sock' $1 '$2' $SELF $3 >/dev/null 2>&1 & "; shift 3; done
+  LIVE=(--listen="$sock" --bind "start:execute-silent:$cmd")
+}
+LIVE=()
+live() { # <seconds> <fzf action> [<seconds> <fzf action>]: sets LIVE to the fzf arguments that repeat them
+  local sock="${NOTES:-${TMPDIR:-/tmp}/$PROG}.$$.$RANDOM.sock" cmd=""
+  while [[ $# -ge 2 ]]; do cmd+="$SELF _ticker '$sock' $1 '$2' >/dev/null 2>&1 & "; shift 2; done
+  LIVE=(--listen="$sock" --bind "start:execute-silent:$cmd")
+}
+
+# ---- interactive menu (fzf) ----
+
+C_RESET="" C_BOLD="" C_DIM="" C_GREEN="" C_YELLOW="" C_RED="" C_CYAN=""
+if [[ -t 1 || -n "${AA_COLOR:-}" ]]; then
+  C_RESET=$'\e[0m' C_BOLD=$'\e[1m' C_DIM=$'\e[2m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_RED=$'\e[31m' C_CYAN=$'\e[36m'
+fi
+TAB=$'\t'
+FZF_OPTS=(--ansi --layout=reverse --height=~80% --min-height=14 --border=rounded
+  --border-label=" $PROG " --border-label-pos=3 --info=hidden --pointer='▶' --marker='✓ ' --gutter=' '
+  --delimiter="$TAB" --with-nth=2.. --header-first --no-sort --cycle --no-separator
+  --color='border:244,label:110:bold,header:250,pointer:110,marker:114,hl:179,hl+:179,prompt:110,query:255')
+
+# The menu redraws from the top of the screen every time. Results and messages from the last action
+# are kept in NOTES and shown once, above the next screen's title.
+NOTES=""
+info() { if [[ -n "$NOTES" ]]; then printf '%s\n' "${C_CYAN}›${C_RESET} $*" >> "$NOTES"; else printf '%s\n' "${C_CYAN}›${C_RESET} $*"; fi; }
+top() { printf '\e[H\e[2J' > /dev/tty; }
+
+# ---- loading box: shown while the next screen is prepared ----
+SPIN_PID=""
+loading() { # <title> [detail]: an animated box on the terminal until loaded (or the next screen) replaces it
+  loaded
+  [[ -n "${NOTES:-}" ]] && { : > /dev/tty; } 2>/dev/null || return 0   # only in the menu, and only with a terminal
+  "$SELF" _spin "$$" "$1" "${2:-}" > /dev/tty 2>/dev/null &
+  SPIN_PID=$!
+}
+loaded() { # stops the loading box, if it is still ours
+  [[ -n "$SPIN_PID" ]] || return 0
+  ps -o command= -p "$SPIN_PID" 2>/dev/null | grep -q " _spin " && { kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null; }
+  SPIN_PID=""; printf '\e[?25h\e[?7h' > /dev/tty 2>/dev/null || true
+}
+spin() { # <menu pid> <title> <detail>: one line at the top with growing squares, while the menu lives
+  local parent="$1" title="$2" detail="$3" i=0 n bar secs
+  local S=$'\e[38;5;110m' E=$'\e[38;5;240m' R=$'\e[0m' BO=$'\e[1m' D=$'\e[2m'
+  trap 'printf "\e[?25h\e[?7h"; exit 0' TERM INT
+  sleep 0.15   # a quick load never shows anything
+  printf '\e[?25l\e[?7l\e[H\e[2J'   # no cursor, no line wrap: the line is cut at the screen edge
+  SECONDS=0
+  while kill -0 "$parent" 2>/dev/null && [[ $SECONDS -lt 900 ]]; do
+    n=$((i % 7)); [[ $n -le 5 ]] || n=0   # 0 to 5 squares filled, then again
+    bar="$S$(printf '%*s' "$n" '' | sed 's/ /■/g')$E$(printf '%*s' $((5 - n)) '' | sed 's/ /■/g')$R"
+    secs=""; [[ $SECONDS -ge 2 ]] && secs=" · ${SECONDS}s"
+    printf '\e[H  %s  %s%s%s%s%s%s\e[K' "$bar" "$BO" "$title" "$R" "$D" "${detail:+ · $detail}" "$secs$R"
+    i=$((i + 1)); sleep 0.15
+  done
+  printf '\e[?25h\e[?7h'
+}
+
+BACK="__back"
+BACK_LINE="$BACK$TAB${C_YELLOW}← Back${C_RESET}"
+ON_ENTER="enter:transform:[ {1} = $BACK ] && echo abort || echo accept"
+
+pick() { # <title> <hint> [fzf args...]; reads "value<TAB>label" lines; prints the chosen values; fails on Back or Esc
+  # NO_BACK=1 leaves out the "← Back" line (main menu); BACK_FIRST=1 puts it on top, where the cursor starts
+  local title="$1" hint="$2" items out notes; shift 2
+  items=$(cat)
+  if [[ -z "${NO_BACK:-}" ]]; then
+    if [[ -n "${BACK_FIRST:-}" ]]; then items="$BACK_LINE${items:+$'\n'$items}"; else items="${items:+$items$'\n'}$BACK_LINE"; fi
+  fi
+  notes=$(take_notes); loaded; top
+  local header="${C_BOLD}${title}${C_RESET}"$'\n'"${C_DIM}${hint}${C_RESET}"
+  [[ -n "${PICK_HEADER:-}" ]] && header="$PICK_HEADER"
+  out=$(printf '%s\n' "$items" | fzf "${FZF_OPTS[@]}" --header="${notes:+$notes$'\n'}$header"$'\n' \
+    --bind "$ON_ENTER" "$@") || return 1
+  out=$(printf '%s\n' "$out" | cut -f1 | grep -vx "$BACK") || return 1
+  printf '%s\n' "$out"
+}
+pick_one() { pick "$1" "$2 · Enter: choose" --no-input --bind 'q:abort,j:down,k:up'; }
+pick_many() { # <title> <hint> <1-based lines to tick first> [search]: search lets you type to filter long lists
+  local load="" i
+  for i in $3; do load+="pos($i)+select+"; done
+  if [[ "${4:-}" == search ]]; then
+    pick "$1" "$2 · Type to search · Space: tick · Enter: confirm" --multi \
+      --bind "space:transform:[ {1} = $BACK ] && echo ignore || echo toggle" ${load:+--bind "load:${load}first"}
+  else
+    pick "$1" "$2 · Space: tick · Enter: confirm" --multi --no-input \
+      --bind "space:transform:[ {1} = $BACK ] && echo ignore || echo toggle" --bind 'q:abort,j:down,k:up' ${load:+--bind "load:${load}first"}
+  fi
+}
+ask() { # <title> <hint> [default]: one line of text; fails on Back or Esc
+  local out notes
+  notes=$(take_notes); loaded; top
+  out=$(printf '%s\n' "ok$TAB${C_GREEN}✓ Confirm${C_RESET}" "$BACK_LINE" |
+    fzf --ansi --layout=reverse --height=~20 --border=rounded --border-label=" $PROG " --border-label-pos=3 \
+    --info=hidden --no-separator --prompt='› ' --query="${3:-}" --disabled --delimiter="$TAB" --with-nth=2.. \
+    --pointer='▶' --gutter=' ' --no-sort --cycle \
+    --bind "enter:transform:[ {1} = $BACK ] && echo abort || echo print-query" \
+    --color='border:244,label:110:bold,header:250,prompt:110,query:255,pointer:110' \
+    --header="${notes:+$notes$'\n'}${C_BOLD}$1${C_RESET}"$'\n'"${C_DIM}$2 · Type, then Enter${C_RESET}"$'\n' --header-first) || return 1
+  printf '%s' "$out" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+choose() { # <title> <hint> <default> <value|label>...: a pick_one whose default comes first
+  local title="$1" hint="$2" def="$3" item; shift 3
+  { for item in "$@"; do [[ "${item%%|*}" == "$def" ]] && printf '%s\t%s\n' "${item%%|*}" "${item#*|}"; done
+    for item in "$@"; do [[ "${item%%|*}" != "$def" ]] && printf '%s\t%s\n' "${item%%|*}" "${item#*|}"; done; true; } |
+    pick_one "$title" "$hint"
+}
+
+run_title() { # <command args...>: what run is doing, for the loading box
+  case "$1" in
+    up)         echo "Setting up task $2" ;;
+    start)      echo "Starting $3 on $2" ;;
+    resume)     echo "Resuming $2" ;;
+    resume-all) echo "Resuming every task that closed unexpectedly" ;;
+    restart)    echo "Restarting $3 on $2" ;;
+    stop)       echo "Stopping $3 on $2" ;;
+    remove)     echo "Removing $3 from $2" ;;
+    down)       echo "Shutting down $2" ;;
+    say)        echo "Sending the message to $3 on $2" ;;
+    add-repo)   echo "Adding $2" ;;
+    attach)     echo "Opening $2" ;;
+    *)          echo "Working" ;;
+  esac
+}
+run_detail() {
+  case "$1" in
+    up|start)       echo "Creating worktrees where needed and starting Claude Code" ;;
+    resume*)        echo "Opening the session and continuing the conversations" ;;
+    restart)        echo "Stopping, then continuing the same conversation" ;;
+    stop)           echo "Ending the Claude Code sessions" ;;
+    remove)         echo "Stopping the agents, then deleting panes, worktrees and containers" ;;
+    down)           echo "Stopping the agents and cleaning up Docker" ;;
+    add-repo)       [[ "$2" == */* ]] || echo "Cloning it from GitHub when there is no local copy" ;;
+  esac
+  return 0
+}
+run() { # <label> <args...>: runs this script quietly; the menu then shows "✓ label", or the error on failure
+  local label="$1" status=0 out="$NOTES.out"; shift
+  [[ -n "${AA_SHOWN:-}" ]] && : > "$AA_SHOWN"
+  if in_list --here "$*"; then   # opens the session in this terminal, so it needs the terminal to itself
+    top; : > "$out"; "$SELF" "$@" || status=$?
+  else
+    loading "$(run_title "$@")" "$(run_detail "$@")"
+    "$SELF" "$@" > "$out" 2>&1 || status=$?
+    loaded
+  fi
+  if [[ $status -eq 0 && -n "${AA_POPUP:-}" ]] && in_list --here "$*"; then exit 0; fi   # popup: you are there now
+  if [[ $status -eq 0 ]]; then
+    printf '%s\n' "${C_GREEN}✓${C_RESET} $label" >> "$NOTES"
+  else
+    printf '%s\n' "${C_RED}✗ Failed:${C_RESET} $label" >> "$NOTES"
+    sed -e "s/^$PROG: //" -e '/^Preparing worktree/d' -e '/^HEAD is now at/d' "$out" | tail -n 4 | sed 's/^/  /' >> "$NOTES" || true
+  fi
+  return 0
+}
+
+agent_state() { # <agent>: working, needs-you, idle, stopped or crashed
+  local p screen
+  if ! is_running "$1"; then
+    read_state "$1"; [[ "$ST" == crashed ]] && echo crashed || echo stopped
+    return 0
+  fi
+  read_state "$1"
+  if [[ -n "$ST" && "$ST" != stopped && "$ST" != crashed ]]; then   # reported by the agent's own hooks
+    case "$ST" in
+      working|needs-you) if interrupted "$1"; then echo idle; else echo "$ST"; fi ;;   # Esc ends a turn without a Stop event
+      *) echo idle ;;
+    esac
+    return 0
+  fi
+  # agents started before this version have no hooks: read what Claude Code shows on screen
+  p=$(agent_pane "$1")
+  screen=$(tmux capture-pane -p -t "$p" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 15 || true)
+  if grep -qE 'Do you want to|Would you like to|❯ *1\. Yes' <<< "$screen"; then echo needs-you
+  elif grep -q 'esc to interrupt' <<< "$screen"; then echo working
+  else echo idle; fi
+}
+dot() { # <agent> [word] [state]: coloured state of one agent of the current task; "word" spells the state out
+  local st="${3:-}" name; name=$(printf '%-5s' "$1")
+  [[ -n "$st" ]] || st=$(agent_state "$1")
+  case "$st" in
+    working)   printf '%s' "${C_GREEN}●${C_RESET} $name${2:+ ${C_GREEN}working  ${C_RESET}}" ;;
+    needs-you) printf '%s' "${C_YELLOW}◆${C_RESET} $name${2:+ ${C_YELLOW}${C_BOLD}needs you${C_RESET}}" ;;
+    idle)      printf '%s' "${C_CYAN}●${C_RESET} $name${2:+ ${C_DIM}idle     ${C_RESET}}" ;;
+    crashed)   printf '%s' "${C_RED}✗${C_RESET} $name${2:+ ${C_RED}crashed  ${C_RESET}}" ;;
+    *)         printf '%s' "${C_DIM}○ $name${2:+ stopped  }${C_RESET}" ;;
+  esac
+}
+all_tasks() { # tasks with worktrees or a tmux session, newest first
+  { if [[ -d "$WT_ROOT" ]]; then ls -t "$WT_ROOT"; fi; tmux ls -F '#S' 2>/dev/null | sed -n "s/^$PREFIX-//p"; } |
+    grep -E '^[a-z0-9][a-z0-9_-]*$' | awk '!seen[$0]++' |
+    while read -r t; do if [[ -d "$WT_ROOT/$t" ]] || tmux has-session -t "=$PREFIX-$t" 2>/dev/null; then echo "$t"; fi; done
+  return 0
+}
+task_line() { # <task>: "task<TAB>name   ● be  ○ ui   not open"
+  local r out=""
+  use_task "$1"
+  for r in $(known_roles); do out+="$(dot "$r")   "; done
+  session_exists || out+="${C_YELLOW}not open${C_RESET}"
+  printf '%s\t%-34s %s\n' "$1" "$1" "$out"
+}
+agent_line() { # <agent> [note]
+  printf '%s\t%-6s %-30s %s\n' "$1" "$1" "$(basename "$(repo_path "$1")")" "${C_DIM}$(repo_desc "$1")${2:+ · $2}${C_RESET}"
+}
+count() { echo $#; }
+plural() { if [[ "$1" -eq 1 ]]; then echo "1 $2"; else echo "$1 $2s"; fi; }
+
+current_layout() { # the layout the current task uses now, else the default
+  local names; names=$(tmux list-windows -t "=$S" -F '#{window_name}' 2>/dev/null || true)
+  if echo "$names" | grep -qx agents; then echo split
+  elif [[ -n "$names" ]] && echo "$names" | grep -qvx srv; then echo own
+  else echo "$DEFAULT_LAYOUT"; fi
+}
+ask_layout() { choose "Layout" "How should the agents sit in tmux?" "${1:-$(current_layout)}" \
+  "own|Own window per agent" "split|Side by side in one window"; }
+ask_remote() { choose "Remote Control" "Remote Control lets you follow and steer the agents away from this Mac" "${1:-$REMOTE}" \
+  "on|On: also in the Claude app and on claude.ai/code" "off|Off: only on this Mac"; }
+ask_open() {
+  local here="This terminal"
+  [[ -n "${TMUX:-}" ]] && here="This terminal (switch tmux to it)"
+  choose "Open" "Where should the task's tmux session open?" "${1:-$DEFAULT_OPEN}" \
+    "window|New iTerm2 window" "tab|New tab in the front iTerm2 window" "here|$here" "detached|Don't open it now"
+}
+ask_mode() { choose "Conversation" "How should the agents start?" "${1:-continue}" \
+  "continue|Continue their last conversation" "fresh|Fresh conversation with the role prompt"; }
+
+# Flows are numbered steps. "← Back" (or Esc) goes one step back; back from the first step leaves the flow.
+# Steps that don't apply are skipped in the direction of travel.
+next() { step=$((step + 1)); dir=1; }
+back() { step=$((step - 1)); dir=-1; }
+skip() { step=$((step + dir)); }
+ticks() { # <chosen agents> <agents in list order>: 1-based positions to tick again on a revisit
+  local r i=0 out=""
+  for r in $2; do i=$((i + 1)); in_list "$r" "$1" && out+="$i "; done
+  echo "$out"
+}
+
+setting() { jq -r --arg k "$1" '.[$k] // empty' "$HOME/.claude/settings.json" 2>/dev/null || true; }   # <key> from your Claude Code settings
+choice_now() { # <agent> <model|effort>: saved in the task, else your last choice for that agent, else default
+  local v
+  v=$(saved_choice "$1" "$2")
+  [[ -n "$v" ]] || v=$(awk -v r="$1" -v k="$2" '$1 == r { print (k == "model") ? $2 : $3 }' "$LAST_CHOICE_FILE" 2>/dev/null)
+  echo "${v:-default}"
+}
+choice_label() { # <model|effort> <value>
+  if [[ "$2" == default ]]; then
+    local s; s=$(setting "$([[ $1 == model ]] && echo model || echo effortLevel)")
+    printf '%s' "${C_DIM}default${s:+ ($s)}${C_RESET}"
+  else printf '%s' "$2"; fi
+}
+CH=""   # "agent:model:effort ..." chosen on the Model and effort screen
+ask_models() { # <agents>: the Model and effort screen; sets CH; fails on Back
+  local r item sel m e lines new=""
+  for r in $1; do   # keep earlier answers when coming back to this screen
+    item=$(echo " $CH " | tr ' ' '\n' | grep "^$r:" || true)
+    new+="${item:-$r:$(choice_now "$r" model):$(choice_now "$r" effort)} "
+  done
+  CH="${new% }"
+  while :; do
+    lines="__ok$TAB${C_GREEN}✓ Use these${C_RESET}"$'\n'
+    [[ $(count $1) -ge 2 ]] && lines+="__all$TAB  All agents: set one model and effort for every agent"$'\n'
+    for item in $CH; do
+      IFS=: read -r r m e <<< "$item"
+      lines+="$r$TAB  $(printf '%-6s' "$r") model $(choice_label model "$m") · effort $(choice_label effort "$e")"$'\n'
+    done
+    sel=$(printf '%s' "$lines" | pick "Model and effort" \
+      "Enter on an agent to change it · the overview shows what each agent costs") || return 1
+    case "$sel" in
+      __ok) return 0 ;;
+      __all) r=""; m=$(echo "$CH" | cut -d' ' -f1 | cut -d: -f2); e=$(echo "$CH" | cut -d' ' -f1 | cut -d: -f3) ;;
+      *) r="$sel"; item=$(echo "$CH" | tr ' ' '\n' | grep "^$r:"); m=$(echo "$item" | cut -d: -f2); e=$(echo "$item" | cut -d: -f3) ;;
+    esac
+    m=$(choose "Model${r:+ for $r}" "Applies when the agent starts" "$m" \
+      "default|Default: your Claude Code setting$( s=$(setting model); [[ -n "$s" ]] && echo " ($s)")" \
+      "fable|Fable: most capable, highest cost" "opus|Opus: strong all-rounder" \
+      "sonnet|Sonnet: faster and cheaper" "haiku|Haiku: fastest and cheapest") || continue
+    e=$(choose "Effort${r:+ for $r}" "Higher effort thinks longer and costs more" "$e" \
+      "default|Default: your Claude Code setting$( s=$(setting effortLevel); [[ -n "$s" ]] && echo " ($s)")" \
+      "low|Low" "medium|Medium" "high|High" "xhigh|Extra high" "max|Max") || continue
+    new=""
+    for item in $CH; do
+      if [[ -z "$r" || "${item%%:*}" == "$r" ]]; then new+="${item%%:*}:$m:$e "; else new+="$item "; fi
+    done
+    CH="${new% }"
+  done
+}
+choice_args() { # turns CH into --model / --effort arguments in ARGS_CH (nothing when all are default)
+  local item r m e ms="" es="" any=""
+  ARGS_CH=()
+  for item in $CH; do
+    IFS=: read -r r m e <<< "$item"
+    ms+="$r=$m,"; es+="$r=$e,"
+    [[ "$m" != default || "$e" != default || -n "$(saved_choice "$r" model)$(saved_choice "$r" effort)" ]] && any=1
+  done
+  [[ -n "$any" ]] && ARGS_CH=(--model "${ms%,}" --effort "${es%,}")
+  return 0
+}
+choice_summary() { # "be Opus · high, ui Sonnet · default"
+  local item r m e out=""
+  for item in $CH; do IFS=: read -r r m e <<< "$item"; out+="$r $m · $e, "; done
+  printf '%s' "${out%, }"
+}
+remember_choices() { # your last model and effort per agent, offered next time
+  local item r m e
+  mkdir -p "$ORG_DIR"
+  for item in $CH; do
+    IFS=: read -r r m e <<< "$item"
+    { grep -v "^$r " "$LAST_CHOICE_FILE" 2>/dev/null || true; echo "$r $m $e"; } > "$LAST_CHOICE_FILE.tmp" && mv "$LAST_CHOICE_FILE.tmp" "$LAST_CHOICE_FILE"
+  done
+}
+
+flow_start() {
+  CH=""
+  local step=1 dir=1 choice="" from="" task="" err="" new="" lines pre r roles="" running offered goal="" mode="" layout="" remote="" open="" args summary issues="" issue="" title
+  while :; do
+    case $step in
+      0) return 0 ;;
+      1) choice=$( { printf '__new\t%s\n' "${C_CYAN}+ New task${C_RESET}"
+                     printf '__issue\t%s\n' "${C_CYAN}+ New task from a GitHub issue${C_RESET}  ${C_DIM}$(issues_where)${C_RESET}"
+                     for r in $(all_tasks); do task_line "$r"; done; } |
+           pick "Start agents: which task?" "Type to search · Enter: choose") || { back; continue; }
+         case "$choice" in
+           __new)   [[ -n "$new" && -z "$from" ]] || task=""; new=1; from="" ;;
+           __issue) [[ "$from" == issue ]] || { task=""; goal=""; }; new=1; from=issue ;;
+           *)       new=""; from=""; task="$choice" ;;
+         esac
+         roles=""; next ;;
+      2) [[ "$from" == issue ]] || { skip; continue; }
+         if [[ -z "$issues" ]]; then
+           loading "Loading the open issues" "$(issues_where)"
+           issues=$(issue_lines 2>/dev/null || true); loaded
+           if [[ -z "$issues" ]]; then info "No open issues found in $(issues_where), or GitHub didn't answer. Check: gh auth status"; back; continue; fi
+         fi
+         issue=$(printf '%s\n' "$issues" | pick "Which issue?" "Type a number or words to search · Enter: choose" --height=90% \
+           --preview "gh issue view {1} 2>/dev/null | head -n 200" \
+           --preview-window='right,55%,wrap,border-left,<50(down,50%,wrap,border-top)') || { back; continue; }
+         title=$(printf '%s\n' "$issues" | awk -F'\t' -v n="$issue" '$1 == n { t = $2; sub(/^[^#]*#[0-9]+  /, "", t); sub(/   · .*$/, "", t); print t; exit }')
+         task=$(issue_task_name "${issue##*/}" "$title")
+         goal="Work on GitHub issue $issue: $title"
+         next ;;
+      3) [[ -n "$new" ]] || { skip; continue; }
+         task=$(ask "New task name" "${err:-Becomes the branch name in every repo. Lowercase letters, digits, - or _}" "$task") || { err=""; back; continue; }
+         if [[ ! "$task" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then err="${C_RED}Use lowercase letters, digits, - or _, starting with a letter or digit${C_RESET}"
+         elif [[ -d "$WT_ROOT/$task" ]] || tmux has-session -t "=$PREFIX-$task" 2>/dev/null; then err="${C_RED}Task $task exists. Go back and pick it from the list${C_RESET}"
+         else err=""; next; fi ;;
+      4) use_task "$task"; lines=""; running=""; offered=""
+         for r in $(all_roles); do
+           if [[ -z "$new" ]] && is_running "$r"; then running+="$r "; continue; fi
+           offered+="$r "
+           if [[ -n "$new" ]]; then lines+="$(agent_line "$r")"$'\n'
+           elif [[ -d "$(wt_dir "$r")" ]]; then lines+="$(agent_line "$r" stopped)"$'\n'
+           else lines+="$(agent_line "$r" "not in this task yet")"$'\n'; fi
+         done
+         [[ -s "$ORG_CACHE/repos.tsv" ]] || loading "Loading the repositories of ${ORG}" "From GitHub, once an hour"
+         lines+=$(new_repo_lines); loaded
+         if [[ -z "$lines" ]]; then info "Every agent of $task is already running."; back; continue; fi
+         pre=$(ticks "$roles" "$offered")   # nothing ticked at first; only a revisit keeps your ticks
+         roles=$(printf '%s\n' "$lines" | grep . | pick_many "Which repositories should get an agent on $task?" \
+           "${running:+Already running: ${running}· }Only ticked ones start and get a worktree. Nothing ticked: the highlighted one starts" "$pre" search) || { roles=""; back; continue; }
+         roles=$(set_up_new "$roles") || { roles=""; load_repos; continue; }
+         load_repos; roles=$(ordered "$(echo $roles)"); next ;;
+      5) use_task "$task"; ask_models "$roles" || { back; continue; }; next ;;
+      6) [[ -n "$new" ]] || { skip; continue; }
+         goal=$(ask "What should the agents work on?" "Optional: a goal, issue link or first instruction. Empty: they wait for you" "$goal") || { back; continue; }
+         next ;;
+      7) mode=continue
+         has_prompt "$roles" && [[ -z "$new" ]] || { skip; continue; }
+         mode=$(ask_mode "$mode") || { back; continue; }
+         next ;;
+      8) layout=""
+         [[ $(count $roles $running) -ge 2 ]] || { skip; continue; }
+         layout=$(ask_layout "$layout") || { back; continue; }
+         next ;;
+      9) remote=$(ask_remote "$remote") || { back; continue; }; next ;;
+      10) open=$(ask_open "$open") || { back; continue; }; next ;;
+      11) if [[ -n "$new" ]]; then
+           args=(up "$task" --only "$(csv "$roles")")
+           [[ -n "$goal" ]] && args+=(--goal "$goal")
+         else
+           args=(start "$task" "$(csv "$roles")")
+           [[ "$mode" == fresh ]] && args+=(--fresh)
+         fi
+         [[ -n "$layout" ]] && args+=("--$layout")
+         choice_args; [[ ${#ARGS_CH[@]} -gt 0 ]] && args+=("${ARGS_CH[@]}")
+         args+=(--remote "$remote" "--$open")
+         summary="Task: $task${new:+ (new)} · Agents: $(csv "$roles")${goal:+ · Goal: $goal}"$'\n'"Model and effort: $(choice_summary)"
+         printf 'go\tStart\n' | pick_one "Ready to start?" "$summary" | grep -qx go || { back; continue; }
+         remember_choices
+         run "Started $(csv "$roles") on $task" "${args[@]}"; return 0 ;;
+    esac
+  done
+}
+new_repo_lines() { # repositories of $ORG without an agent yet, as "+name<TAB>label" (they are set up when ticked)
+  local have n d
+  have=" $(set_up_names | tr '\n' ' ') "
+  org_repos | while IFS=$'\t' read -r n d; do
+    [[ -n "$n" && "$have" != *" $(lower "$n") "* ]] || continue
+    printf '+%s\t%s\n' "$n" "${C_DIM}○${C_RESET} $(printf '%-24s' "$n")${C_DIM}${d:+$d · }new: sets it up as an agent${C_RESET}"
+  done
+}
+set_up_new() { # <picked values>: sets up every "+repo" (cloned when needed) and prints all as agents; fails after showing why
+  local v out="" key err
+  err=$(mktemp "${TMPDIR:-/tmp}/$PROG.err.XXXXXX")
+  for v in $1; do
+    if [[ "$v" != +* ]]; then out+="$v "; continue; fi
+    loading "Setting up ${v#+}" "Looking for a local copy, else cloning $ORG/${v#+} to ${CLONE_ROOT/#$HOME/~}/$ORG"
+    if key=$(org_add "${v#+}" 2>"$err"); then loaded; out+="$key "; info "Set up ${v#+} as agent $key"
+    else loaded; info "${C_RED}$(sed "s/^$PROG: //" "$err")${C_RESET}"; rm -f "$err"; load_repos; return 1; fi
+  done
+  rm -f "$err"; load_repos
+  echo "${out% }"
+}
+has_prompt() { local r; for r in $1; do [[ -f "$WT_ROOT/$TASK/$r.prompt.md" ]] && return 0; done; return 1; }
+
+agents_lines() { # the Running agents list; its live refresh calls this too
+  local s r w=8
+  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+    s="${s#"$PREFIX-"}"; [[ ${#s} -gt $w ]] && w=${#s}
+  done
+  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+    use_task "${s#"$PREFIX-"}"
+    for r in $(known_roles); do
+      printf '%s\n' "$TASK|$r$TAB$(printf "%-${w}s" "$TASK")  $(dot "$r" word) ${C_DIM}$(basename "$(repo_path "$r")")${C_RESET}"
+    done
+  done
+  printf '%s\n' "$BACK_LINE"
+}
+
+flow_running() {
+  local lines sel task role
+  while :; do
+    loading "Loading the running agents" "Their state and what they are doing"
+    lines=$(agents_lines); loaded
+    [[ "$lines" != "$BACK_LINE" ]] || { info "No open tasks. Start agents from the main menu."; return 0; }
+    live_feed 3 "reload(@@)+refresh-preview" _agents
+    sel=$(printf '%s\n' "$lines" | NO_BACK=1 pick "Running agents" "Live view on the right, updates every 3 seconds · Enter: actions · Type to search" \
+      --height=90% --track --id-nth=1 "${LIVE[@]}" --preview "[ {1} = $BACK ] || $SELF _preview {1}" \
+      --preview-window='right,60%,follow,border-left,<50(down,55%,follow,border-top)') || return 0
+    task="${sel%%|*}"; role="${sel#*|}"
+    agent_actions "$task" "$role" || return 0
+  done
+}
+
+agent_actions() { # <task> <agent>: the action menu; Back returns to the agent list. Fails when the list should close
+  local task="$1" role="$2" act how msg name
+  while :; do
+    use_task "$task"; name=$(agent_name "$role")
+    if is_running "$role"; then
+      act=$(printf '%s\n' "open${TAB}Open $name" "say${TAB}Send $name a message" "all${TAB}Send every agent of $task a message" \
+        "stop${TAB}Stop $name" "model${TAB}Change model or effort of $name (restarts it, keeps the conversation)" "tools${TAB}Skills, plugins and MCP servers $name used" "remove${TAB}Remove $name with its worktree" "down${TAB}Shut down the whole task $task" |
+        pick_one "$name" "running in $(tmux display-message -p -t "$(agent_pane "$role")" '#{window_index}:#{window_name}')") || return 0
+    else
+      act=$(printf '%s\n' "continue${TAB}Start it, continuing its last conversation" "fresh${TAB}Start it with a fresh conversation" \
+        "open${TAB}Open $name" "model${TAB}Change model or effort of $name" "tools${TAB}Skills, plugins and MCP servers $name used" "remove${TAB}Remove $name with its worktree" "down${TAB}Shut down the whole task $task" |
+        pick_one "$name" "stopped") || return 0
+    fi
+    case "$act" in
+      open)     how=$(ask_open here) || continue
+                [[ "$how" == detached ]] && continue
+                run "Opened $name" attach "$task" "--$how" --agent "$role" ;;
+      say)      msg=$(ask "Message to $name" "Typed into the agent and sent with Enter") || continue
+                [[ -n "$msg" ]] || continue
+                run "Message sent to $name" say "$task" "$role" "$msg" ;;
+      all)      msg=$(ask "Message to every running agent of $task" "Typed into each agent and sent with Enter") || continue
+                [[ -n "$msg" ]] || continue
+                run "Message sent to every running agent of $task" say "$task" all "$msg" ;;
+      stop)     printf 'go\tStop it\n' | pick_one "Stop $name?" "Its pane stays open as a shell; resume it any time" |
+                  grep -qx go || continue
+                run "Stopped $name" stop "$task" "$role" ;;
+      tools)    agent_inventory "$task" "$role"; continue ;;
+      model)    CH=""; ask_models "$role" || continue
+                choice_args; remember_choices
+                if is_running "$role"; then run "Restarted $name with $(choice_summary)" restart "$task" "$role" "${ARGS_CH[@]+"${ARGS_CH[@]}"}"
+                else run "Saved $(choice_summary) for $name; it applies when it starts" save-choice "$task" "$role" "${ARGS_CH[@]+"${ARGS_CH[@]}"}"; fi ;;
+      continue) run "Started $name" start "$task" "$role" ;;
+      fresh)    run "Started $name with a fresh conversation" start "$task" "$role" --fresh ;;
+      down)     flow_down "$task" || continue; return 1 ;;
+      remove)   confirm_remove "$task" "$role" || continue ;;
+    esac
+    return 0
+  done
+}
+
+confirm_remove() { # <task> <agents>: asks, then removes; fails on Back
+  local task="$1" roles="$2" dirty all=1 r what force=""
+  use_task "$task"
+  for r in $(known_roles); do in_list "$r" "$roles" || all=""; done
+  what="Stops it, closes its panes, deletes its worktree. Branch $task stays"
+  [[ -n "$all" ]] && what="That is every agent, so the whole task goes: docker, tmux session, worktrees. Branch $task stays"
+  dirty=$(dirty_roles "$roles")
+  if [[ -n "$dirty" ]]; then
+    printf '%s\n' "force${TAB}${C_RED}Remove anyway and delete the uncommitted changes in: $dirty${C_RESET}" |
+      BACK_FIRST=1 pick_one "Remove $(csv "$roles") from $task?" "${C_YELLOW}Uncommitted changes in: $dirty${C_RESET}"$'\n'"$what" | grep -qx force || return 1
+    force=1
+  else
+    printf 'go\tRemove\n' | pick_one "Remove $(csv "$roles") from $task?" "$what" | grep -qx go || return 1
+  fi
+  run "Removed $(csv "$roles") from $task" remove "$task" "$(csv "$roles")" ${force:+--force}
+}
+
+flow_remove() {
+  local step=1 dir=1 t lines task="" roles="" known r merged
+  while :; do
+    case $step in
+      0) return 0 ;;
+      1) lines=""; for t in $(all_tasks); do lines+="$(task_line "$t")"$'\n'; done
+         [[ -n "$lines" ]] || { info "No tasks to remove."; return 0; }
+         merged=$(merged_tasks)
+         [[ -n "$merged" ]] && lines="__merged$TAB${C_GREEN}✓ Remove every merged task ($(count $merged)): $(csv "$merged")${C_RESET}"$'\n'"$lines"
+         task=$(printf '%s' "$lines" | pick "Remove agents: which task?" "Merged means: every pull request merged, no uncommitted changes · Enter: choose") || { back; continue; }
+         if [[ "$task" == __merged ]]; then
+           printf 'go\tRemove them\n' | pick_one "Remove $(plural "$(count $merged)" "merged task")?" \
+             "$(csv "$merged"): agents, tmux sessions, docker, worktrees. Branches stay" | grep -qx go || continue
+           for t in $merged; do use_task "$t"; r=$(known_roles); run "Removed merged task $t" remove "$t" "$(csv "${r% }")"; done
+           return 0
+         fi
+         roles=""; next ;;
+      2) use_task "$task"; known=$(known_roles)
+         roles=$(for r in $known; do agent_line "$r" "$(is_running "$r" && echo running || echo stopped)"; done |
+           pick_many "Which agents of $task should be removed?" "Tick all of them to remove the whole task" "$(ticks "$roles" "$known")") || { back; continue; }
+         roles=$(ordered "$(echo $roles)"); next ;;
+      3) confirm_remove "$task" "$roles" || { back; continue; }; return 0 ;;
+    esac
+  done
+}
+
+flow_inventory() { # main menu: everything available, grouped by global, organisation and repositories
+  local inv used lines s r k n c src ref lvl label nplug non nskill nmcp lv count
+  loading "Collecting skills, plugins and MCP servers" "And how often the open agents used them"
+  CLAUDE_ORG=$(with_timeout 5 claude auth status 2>/dev/null | jq -r '.orgName // empty' 2>/dev/null || true)
+  inv=$(inventory)
+  used=$(for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+           use_task "${s#"$PREFIX-"}"; for r in $(task_roles); do agent_tools "$(wt_dir "$r")"; done
+         done | awk -F'\t' '{ n[$1 FS $2] += $3 } END { for (k in n) print k FS n[k] }')
+  # claude.ai connectors exist in your account, not on disk: they show up once an agent used one
+  inv+=$'\n'$(awk -F'\t' '$1 == "mcp" && $2 ~ /^claude_ai_/ { printf "mcp\t%s\tclaude.ai connector\tconnector|%s\torg\n", $2, $2 }' <<< "$used")
+  lines=""
+  for lv in $LEVELS; do
+    count=$(awk -F'\t' -v l="$lv" '$5 == l' <<< "$inv" | grep -c . || true)
+    lines+="head|$lv$TAB${C_CYAN}${C_BOLD}$(level_title "$lv")${C_RESET}  ${C_DIM}$(plural "$count" item)${C_RESET}"$'\n'
+    lines+=$(while IFS=$'\t' read -r k n src ref lvl; do
+              [[ -n "$k" && "$lvl" == "$lv" ]] || continue
+              c=$(awk -F'\t' -v k="$k" -v n="$n" '$1 == k && $2 == n { print $3 }' <<< "$used")
+              label=$(printf '   %s  %-7s %-40s %s %s' "$(level_tag "$lvl")" "$k" "$n" "$([[ -n "$c" ]] && printf '%s' "${C_GREEN}$(printf '%-9s' "used ${c}×")${C_RESET}" || printf '%-9s' '')" "${C_DIM}$src${C_RESET}")
+              [[ "$src" == off* ]] && label="${C_DIM}$label${C_RESET}"
+              printf '%s\t%s\n' "$ref" "$label"
+            done <<< "$inv" | sort -t$'\t' -k2,2)$'\n'
+  done
+  nplug=$(grep -c $'^plugin\t' <<< "$inv" || true); non=$(grep -c $'^plugin\t[^\t]*\ton' <<< "$inv" || true)
+  nskill=$(grep -c $'^skill\t' <<< "$inv" || true); nmcp=$(grep -c $'^mcp\t' <<< "$inv" || true)
+  while :; do
+    printf '%s' "$lines" | pick "Skills, plugins and MCP servers" \
+      "$nplug plugins ($non on) · $nskill skills · $nmcp MCP servers · global, then organisation, then repositories · type global, org or repo to see one level · \"used\": by the open tasks' agents" \
+      --height=90% --preview "CLAUDE_ORG='$CLAUDE_ORG' $SELF _inv {1}" --preview-window='right,50%,wrap,border-left,<50(down,50%,wrap,border-top)' >/dev/null || return 0
+  done
+}
+
+agent_inventory() { # <task> <agent>: what this agent used, then what only its repo adds
+  local task="$1" role="$2" inv used lines="" k n c src ref wt lvl
+  use_task "$task"; wt=$(wt_dir "$role")
+  loading "Reading what $(agent_name "$role") used" "From its Claude Code session files"
+  inv=$(inventory); used=$(agent_tools "$wt")
+  while IFS=$'\t' read -r k n c; do
+    [[ -n "$k" ]] || continue
+    ref=$(awk -F'\t' -v k="$k" -v n="$n" '$1 == k && $2 == n { print $4; exit }' <<< "$inv")
+    src=$(awk -F'\t' -v k="$k" -v n="$n" '$1 == k && $2 == n { print $3; exit }' <<< "$inv")
+    lvl=$(awk -F'\t' -v k="$k" -v n="$n" '$1 == k && $2 == n { print $5; exit }' <<< "$inv")
+    [[ -n "$src" ]] || src=$(tool_source "$k" "$n")
+    [[ -n "$lvl" ]] || lvl=$(level_of_used "$inv" "$k" "$n")
+    [[ -z "$ref" && "$k" == mcp && "$n" == claude_ai_* ]] && ref="connector|$n"
+    lines+="${ref:-none|}$TAB${C_GREEN}$(printf '%4s×' "$c")${C_RESET}  $(level_tag "$lvl")  $(printf '%-8s %-44s' "$k" "$([[ "$k" == command ]] && echo "/$n" || echo "$n")") ${C_DIM}$src${C_RESET}"$'\n'
+  done <<< "$used"
+  while IFS=$'\t' read -r k n src ref lvl; do   # the repo's own skills and MCP servers that this agent didn't use
+    [[ "$src" == "repo $(basename "$(repo_path "$role")")" ]] || continue
+    awk -F'\t' -v k="$k" -v n="$n" '$1 == k && $2 == n { f = 1 } END { exit !f }' <<< "$used" && continue
+    lines+="$ref$TAB${C_DIM}  not used${C_RESET}  $(level_tag repo)  $(printf '%-8s %-44s' "$k" "$n") ${C_DIM}$src${C_RESET}"$'\n'
+  done <<< "$inv"
+  [[ -n "$lines" ]] || lines="none|$TAB${C_DIM}No skills, MCP servers or subagents used yet${C_RESET}"$'\n'
+  while :; do
+    printf '%s' "$lines" | pick "$(agent_name "$role"): skills, plugins and MCP servers" \
+      "Used by this agent, most first, then what only its repo adds · global: your ~/.claude · org: your claude.ai organisation · repo: the repository · Type to search" \
+      --height=90% --preview "$SELF _inv {1}" --preview-window='right,50%,wrap,border-left,<50(down,50%,wrap,border-top)' >/dev/null || return 0
+  done
+}
+
+monitor_header() { # the top of the Monitor: who waits for you and since when, totals, merged tasks
+  local rows need="" n_need=0 n_work=0 n_idle=0 n_stop=0 st who age u usd=0 rate merged
+  rows=$(monitor_lines raw); rate=$(usd_rate)
+  while IFS=$'\t' read -r st who age u; do
+    [[ -n "$st" ]] || continue
+    usd=$(awk -v x="$usd" -v y="${u:-0}" 'BEGIN { printf "%.6f", x + y }')
+    case "$st" in
+      needs-you) n_need=$((n_need + 1)); need+="${who}${age:+ for $age}, " ;;
+      working) n_work=$((n_work + 1)) ;; idle) n_idle=$((n_idle + 1)) ;; stopped) n_stop=$((n_stop + 1)) ;;
+    esac
+  done <<< "$rows"
+  if [[ $n_need -gt 0 ]]; then printf '%s\n' "${C_BOLD}Now    ${C_RESET}  ${C_YELLOW}${C_BOLD}waiting for you: ${need%, }${C_RESET}"
+  else printf '%s\n' "${C_BOLD}Now    ${C_RESET}  ${C_GREEN}nobody is waiting for you${C_RESET}"; fi
+  printf '%s\n' "${C_BOLD}Agents ${C_RESET}  ${C_GREEN}$n_work working${C_RESET} · $n_idle idle · ${C_DIM}$n_stop stopped${C_RESET} · ${C_BOLD}$(money "$usd" "$rate")${C_RESET} so far ${C_DIM}(estimate at API list prices, not your bill)${C_RESET}"
+  merged=$(merged_tasks)
+  [[ -n "$merged" ]] && printf '%s\n' "${C_GREEN}Merged and clean: $(csv "$merged" | sed 's/,/, /g') · remove them from the overview with 5${C_RESET}"
+  printf '\n%s\n%s\n' "${C_BOLD}Monitor${C_RESET} ${C_DIM}· by task · updated $(date +%H:%M:%S)${C_RESET}" \
+    "${C_DIM}Tasks that need you first · age = time since the agent's last step · Enter: actions · ?: live view · Esc or ← Back: overview${C_RESET}"
+  return 0
+}
+
+task_actions() { # <task>: what you can do with a whole task from the Monitor
+  local task="$1" act how msg
+  while :; do
+    act=$(printf '%s\n' "open${TAB}Open $task" "all${TAB}Send every agent of $task a message" "down${TAB}Shut down $task" |
+      pick_one "$task" "the whole task") || return 0
+    case "$act" in
+      open) how=$(ask_open here) || continue
+            [[ "$how" == detached ]] && continue
+            run "Opened $task" attach "$task" "--$how" ;;
+      all)  msg=$(ask "Message to every running agent of $task" "Typed into each agent and sent with Enter") || continue
+            [[ -n "$msg" ]] || continue
+            run "Message sent to every running agent of $task" say "$task" all "$msg" ;;
+      down) flow_down "$task" || continue ;;
+    esac
+    return 0
+  done
+}
+
+flow_monitor() { # all agents on one screen, refreshed every 3 seconds; Enter opens the agent's actions
+  local lines sel
+  while :; do
+    tmux ls -F '#S' 2>/dev/null | grep -q "^$PREFIX-" || { info "No open tasks. Start agents from the main menu."; return 0; }
+    # opens at once; the first refresh fills it in a moment later
+    lines="$BACK_LINE"$'\n'"__loading${TAB}${C_DIM}Loading what every agent is doing…${C_RESET}"
+    live_feed 3 "reload(@@)" _monitor 10 "transform-header(@@)" _monitor_header
+    sel=$(printf '%s\n' "$lines" | PICK_HEADER="${C_BOLD}Monitor${C_RESET}"$'\n'"${C_DIM}Loading…${C_RESET}" NO_BACK=1 pick "" "" \
+      --height=100% --track --id-nth=1 "${LIVE[@]}" --bind '?:toggle-preview' \
+      --preview "case {1} in $BACK|__loading|*'|') echo 'Pick an agent to see its screen.' ;; *) $SELF _preview {1} ;; esac" \
+      --preview-window='right,50%,follow,hidden,border-left,<60(down,50%,follow,hidden,border-top)') || return 0
+    [[ "$sel" == __loading ]] && continue
+    if [[ "$sel" == *"|" ]]; then task_actions "${sel%|}"; else agent_actions "${sel%%|*}" "${sel#*|}" || true; fi
+  done
+}
+
+monitor_pane() { # <pane>: opens the monitor in a narrow pane on the right of that pane's window, or closes it
+  local target="${1:-}" p
+  p=$(tmux list-panes -t "$target" -F '#{@monitor} #{pane_id}' 2>/dev/null | awk '$1 == "1" { print $2; exit }')
+  if [[ -n "$p" ]]; then tmux kill-pane -t "$p"; return 0; fi
+  p=$(tmux split-window -h -l 40% -P -F '#{pane_id}' -t "$target" "$SELF monitor")
+  tmux set-option -p -t "$p" @monitor 1
+}
+
+flow_down() { # <task>; fails on Back
+  local how
+  how=$(printf '%s\n' "keep${TAB}Shut down, keep the worktrees" \
+    "prune${TAB}Shut down and remove the worktrees (stops if a worktree has uncommitted changes)" |
+    pick_one "Shut down $1?" "Stops all its agents and dev servers, removes its docker containers and volumes, closes its tmux session") || return 1
+  case "$how" in
+    keep)  run "Shut down $1" down "$1" ;;
+    prune) run "Shut down $1 and removed its worktrees" down "$1" --prune ;;
+  esac
+}
+
+flow_resume() {
+  CH=""
+  local step=1 dir=1 gone t r lines task="" stopped roles="" mode="" layout="" remote="" open="" args
+  while :; do
+    case $step in
+      0) return 0 ;;
+      1) lines=""
+         for t in $(all_tasks); do
+           use_task "$t"
+           for r in $(task_roles); do if ! is_running "$r"; then lines+="$(task_line "$t")"$'\n'; break; fi; done
+         done
+         [[ -n "$lines" ]] || { info "Nothing to resume: every agent with a worktree is running."; return 0; }
+         gone=$(closed_unexpectedly)
+         [[ -n "$gone" ]] && lines="__all$TAB${C_YELLOW}↻ Resume every task that closed unexpectedly ($(count $gone)): $(csv "$gone")${C_RESET}"$'\n'"$lines"
+         task=$(printf '%s' "$lines" | pick "Resume agents: which task?" "Type to search · Enter: choose") || { back; continue; }
+         if [[ "$task" == __all ]]; then run "Resumed $(csv "$gone")" resume-all; return 0; fi
+         use_task "$task"; stopped=""
+         for r in $(task_roles); do is_running "$r" || stopped+="$r "; done
+         roles=$(ordered "$stopped"); next ;;
+      2) [[ $(count $stopped) -gt 1 ]] || { skip; continue; }
+         roles=$(for r in $stopped; do agent_line "$r" stopped; done |
+           pick_many "Which agents of $task should resume?" "All stopped ones are ticked" "$(ticks "$roles" "$stopped")") || { back; continue; }
+         roles=$(ordered "$(echo $roles)"); next ;;
+      3) ask_models "$roles" || { back; continue; }; next ;;
+      4) mode=$(ask_mode "$mode") || { back; continue; }; next ;;
+      5) layout=""
+         [[ $(count $(task_roles)) -ge 2 ]] || { skip; continue; }
+         layout=$(ask_layout "$layout") || { back; continue; }
+         next ;;
+      6) remote=$(ask_remote "$remote") || { back; continue; }; next ;;
+      7) open=$(ask_open "$open") || { back; continue; }; next ;;
+      8) args=(resume "$task" --only "$(csv "$roles")")
+         [[ "$mode" == fresh ]] && args+=(--fresh)
+         [[ -n "$layout" ]] && args+=("--$layout")
+         choice_args; [[ ${#ARGS_CH[@]} -gt 0 ]] && args+=("${ARGS_CH[@]}")
+         args+=(--remote "$remote" "--$open")
+         printf 'go\tResume\n' | pick_one "Ready to resume?" \
+           "Task: $task · Agents: $(csv "$roles")"$'\n'"Model and effort: $(choice_summary)" | grep -qx go || { back; continue; }
+         remember_choices
+         run "Resumed $(csv "$roles") on $task" "${args[@]}"; return 0 ;;
+    esac
+  done
+}
+
+suggest_key() { # <folder name>: the name itself when it fits, else initials of its words, made unique
+  local k n=2
+  k=$(lower "$1" | tr -cd 'a-z0-9')
+  if [[ ${#k} -le 10 && "$k" =~ ^[a-z] && -z "$(key_problem "$k")" ]]; then echo "$k"; return 0; fi
+  k=$(echo "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' ' ' | awk '{ for (i = 1; i <= NF; i++) printf "%s", substr($i, 1, 1) }')
+  [[ ${#k} -ge 2 ]] || k=$(echo "$1" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9' | cut -c1-4)
+  [[ "$k" =~ ^[a-z] ]] || k="r$k"
+  k=$(echo "$k" | cut -c1-9)
+  if [[ -n "$(key_problem "$k")" ]]; then while [[ -n "$(key_problem "$k$n")" && $n -lt 9 ]]; do n=$((n + 1)); done; k="$k$n"; fi
+  echo "$k"
+}
+
+flow_add_repo() {
+  local step=1 dir=1 sel="" path="" name="" typed="" err="" key="" desc="" found root d n have
+  loading "Loading the repositories of ${ORG}" "And the local folders you could add"
+  have=" $(set_up_names | tr '\n' ' ') "
+  found=$(for root in $REPO_ROOTS; do
+            [[ -d "$root" ]] && find "$root" -mindepth 2 -maxdepth 2 -name .git -type d 2>/dev/null
+          done | sed 's|/\.git$||' | sort -f |
+          while read -r d; do [[ -z "$(path_problem "$d")" ]] && printf '%s\t%s\n' "$d" "${C_DIM}local folder${C_RESET}  ${d/#$HOME/~}"; done) || true
+  while :; do
+    case $step in
+      0) return 0 ;;
+      1) sel=$( { org_repos | while IFS=$'\t' read -r n d; do
+                    [[ -n "$n" && "$have" != *" $(lower "$n") "* ]] && printf '+%s\t%s\n' "$n" "$(printf '%-28s' "$n")${C_DIM}$d${C_RESET}"
+                  done
+                  printf '%s' "$found${found:+$'\n'}"
+                  printf '~\t%s\n' "${C_CYAN}+ Type a path${C_RESET}"; } |
+           pick "Add a repository: which one?" "Repositories of $ORG without an agent (cloned when needed), then local folders · Type to search") || { back; continue; }
+         name=""; path=""
+         case "$sel" in "~") ;; +*) name="${sel#+}" ;; *) path="$sel" ;; esac
+         key=""; desc=""; next ;;
+      2) [[ "$sel" == "~" ]] || { skip; continue; }
+         typed=$(ask "Path to the git repository" "${err:-For example ~/Projects/my-repo}" "$typed") || { err=""; back; continue; }
+         err=$(path_problem "${typed/#\~/$HOME}")
+         if [[ -n "$err" ]]; then err="${C_RED}$err${C_RESET}"; continue; fi
+         path="${typed/#\~/$HOME}"; next ;;
+      3) [[ -n "$path" ]] && path=$(canon "$path")
+         n="${name:-$(basename "$path")}"
+         [[ -n "$key" ]] || key=$(suggest_key "$n")
+         key=$(ask "Short agent name for $n" \
+           "${err:-Sessions are named $PREFIX-<name>-<task>. 1 to 10 lowercase letters or digits}" "$key") || { err=""; back; continue; }
+         err=$(key_problem "$key")
+         if [[ -n "$err" ]]; then err="${C_RED}$err${C_RESET}"; continue; fi
+         next ;;
+      4) [[ -n "$desc" ]] || desc=$( [[ -n "$name" ]] && awk -F'\t' -v n="$name" '$1 == n { print $2; exit }' "$ORG_CACHE/repos.tsv" 2>/dev/null || true)
+         desc=$(ask "What is this repo?" "One short line; the agents read it, for example: Browser extension" "${desc:-$n}") || { back; continue; }
+         next ;;
+      5) printf 'go\tAdd it\n' | pick_one "Add this agent?" \
+           "Agent: $key · Repo: ${name:+$ORG/$name (cloned when there is no local copy)}${path/#$HOME/~} · About: $desc" |
+           grep -qx go || { back; continue; }
+         run "Added agent $key. It now shows up under Start new agents" add-repo "${name:-$path}" "$key" "$desc"
+         return 0 ;;
+    esac
+  done
+}
+
+flow_org() { # which GitHub organisation to work in; fails on Esc
+  local last lines o d n a sel
+  last=$(cat "$CONFIG_DIR/org" 2>/dev/null || true)
+  loading "Loading your GitHub organisations" "From GitHub, once a day"
+  lines=$(owner_lines | while IFS=$'\t' read -r o d; do
+      n=$(tmux ls -F '#S' 2>/dev/null | grep -c "^$(org_prefix "$o")-" || true)
+      a=$(grep -vc '^#' "$CONFIG_DIR/orgs/$o/repos" 2>/dev/null || true)
+      printf '%s\t%s%s%s%s\n' "$o" "$(printf '%-24s' "$o")" "${C_DIM}${d}${C_RESET}" \
+        "$([[ ${a:-0} -gt 0 ]] && echo "${C_DIM} · $(plural "$a" agent)${C_RESET}" || true)" \
+        "$([[ ${n:-0} -gt 0 ]] && echo " · ${C_GREEN}$(plural "$n" "open task")${C_RESET}" || true)$([[ "$o" == "$last" ]] && echo "${C_CYAN} · last used${C_RESET}" || true)"
+    done)
+  if [[ -z "$lines" ]]; then loaded; info "${C_RED}No GitHub organisation found. Check: gh auth status${C_RESET}"; return 1; fi
+  lines=$( { grep "^$last$TAB" <<< "$lines" || true; grep -v "^$last$TAB" <<< "$lines" || true; } )
+  sel=$(printf '%s\n' "$lines" | NO_BACK=1 pick "Which GitHub organisation do you want to work in?" \
+    "Your account and every organisation you belong to · Type to search · Enter: choose · Esc: $1") || return 1
+  use_org "$sel"; remember_org
+  org_watchdogs
+}
+org_watchdogs() { # every open task of $ORG gets its watchdog, also tasks opened by older versions
+  local s
+  for s in $(tmux ls -F '#S' 2>/dev/null | grep "^$PREFIX-" || true); do
+    use_task "${s#"$PREFIX-"}"; [[ -d "$WT_ROOT/$TASK" ]] && { touch "$WT_ROOT/$TASK/.open"; watch_start; }
+  done
+  return 0
+}
+other_orgs_open() { # "acme 2, globex 1": other organisations with open tasks
+  local d o n out=""
+  for d in "$CONFIG_DIR"/orgs/*/; do
+    [[ -d "$d" ]] || continue; o=$(basename "$d"); [[ "$o" == "$ORG" ]] && continue
+    n=$(tmux ls -F '#S' 2>/dev/null | grep -c "^$(org_prefix "$o")-" || true)
+    [[ ${n:-0} -gt 0 ]] && out+="$o $n, "
+  done
+  echo "${out%, }"
+}
+
+preview() { # <task|agent>: the live view shown next to the Running agents list
+  local task="${1%%|*}" role="${1#*|}" p d changes u tk k m e
+  use_task "$task"; p=$(agent_pane "$role"); d=$(wt_dir "$role")
+  if [[ -d "$d" ]]; then
+    changes=$(git -C "$d" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    printf '%s\n' "${C_BOLD}$(agent_name "$role")${C_RESET}  ${C_DIM}branch $(git -C "$d" branch --show-current 2>/dev/null) · $changes changed files${C_RESET}"
+    read -r u tk k m e <<< "$(agent_usage "$d")"
+    [[ "$tk" -gt 0 ]] && printf '%s\n' "${C_DIM}$(model_short "$m")$([[ "$e" != - ]] && echo " · effort $e" || true) · $(tokens_short "$tk") tokens · $(money "$u" "$(usd_rate)")$([[ $k -gt 0 ]] && echo " + $k replies without a known price" || true)${C_RESET}"
+  fi
+  if [[ -z "$p" ]]; then echo "No pane yet."; return 0; fi
+  is_running "$role" || printf '%s\n' "${C_YELLOW}stopped: the pane is a shell${C_RESET}"
+  echo
+  tmux capture-pane -p -e -J -t "$p" | awk '{ lines[NR] = $0; if ($0 ~ /[^[:space:]]/) last = NR } END { for (i = 1; i <= last; i++) print lines[i] }'
+}
+
+with_timeout() { # <seconds> <command...>: runs it, killing it when it takes longer
+  local secs="$1" pid watcher rc=0; shift
+  "$@" & pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & watcher=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true   # reaps it quietly: no "Terminated" line on screen
+  return $rc
+}
+claude_line() { # who Claude Code is logged in as; cached for the menu session in $AA_AUTH
+  local j email org plan exp days ver line
+  if [[ -n "${AA_AUTH:-}" && -s "$AA_AUTH" ]]; then cat "$AA_AUTH"; return 0; fi
+  j=$(with_timeout 5 claude auth status 2>/dev/null || true)
+  ver=$(with_timeout 5 claude --version 2>/dev/null | awk '{ print $1 }' || true)
+  if [[ -z "$j" ]]; then printf '%s' "${C_YELLOW}couldn't read the login (claude auth status gave no answer)${C_RESET}"; return 0; fi
+  if ! grep -q '"loggedIn": *true' <<< "$j"; then
+    line="${C_RED}${C_BOLD}not logged in${C_RESET} · agents can't start until you run: claude auth login"
+  else
+    field() { sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" <<< "$j" | head -n 1; }
+    email=$(field email); org=$(field orgName); plan=$(field subscriptionType); exp=$(field loginExpiresAt)
+    line="$email${org:+ · $org}${plan:+ · $plan plan}"
+    if [[ -n "$exp" ]]; then
+      days=$(( ( $(date -j -u -f '%Y-%m-%dT%H:%M:%S' "${exp%%.*}" +%s 2>/dev/null || date +%s) - $(date +%s) ) / 86400 ))
+      if [[ $days -lt 7 ]]; then line+=" · ${C_YELLOW}login ends in $(plural "$days" day)${C_RESET}"
+      else line+=" · ${C_DIM}login valid $(plural "$days" day)${C_RESET}"; fi
+    fi
+  fi
+  line+="${ver:+ · ${C_DIM}Claude Code $ver${C_RESET}}"
+  [[ -n "${AA_AUTH:-}" ]] && printf '%s' "$line" > "$AA_AUTH"
+  printf '%s' "$line"
+}
+
+git_counts() { # <worktree>: "<changed files> <commits not on the default branch> <current branch>"
+  local n=0 c=0 base br
+  n=$(git -C "$1" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if base=$(git -C "$1" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); then
+    c=$(git -C "$1" rev-list --count "$base..HEAD" 2>/dev/null || echo 0)
+  fi
+  br=$(git -C "$1" branch --show-current 2>/dev/null || true)
+  echo "${n:-0} ${c:-0} ${br:--}"
+}
+dashboard() { # [full|monitor]: the overview above the main menu; monitor keeps only the task numbers
+  local mode="${1:-full}" gone t r st line f a b br prs merged gitdir u tk k m e tusd ttok tunk models rate allusd=0 alltok=0 open="" closed="" w=8 dps n_work=0 n_need=0 n_idle=0 n_stop=0 ch n base d dc dmine=0 dall parts lines="" i=0
+  pr_refresh_if_old
+  rate=$(usd_rate)
+  dps=$(docker ps --format '{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project"}}' 2>/dev/null) || dps="off"
+  for t in $(all_tasks); do
+    use_task "$t"
+    if session_exists; then open+="$t "; [[ ${#t} -gt $w ]] && w=${#t}; else closed+="$t "; fi
+  done
+  gitdir=$(mktemp -d "${TMPDIR:-/tmp}/$PROG.git.XXXXXX")
+  for t in $open; do   # git is the slow part: count changes and commits of every worktree at once
+    use_task "$t"
+    for r in $(task_roles); do
+      (git_counts "$(wt_dir "$r")" > "$gitdir/$t.$r") &
+      (agent_usage "$(wt_dir "$r")" > "$gitdir/$t.$r.use") &
+    done
+  done
+  wait
+  for t in $open; do
+    use_task "$t"; line="$(printf "%-${w}s" "$t")  "
+    for r in $(known_roles); do
+      st=$(agent_state "$r")
+      case "$st" in working) n_work=$((n_work + 1)) ;; needs-you) n_need=$((n_need + 1)) ;; idle) n_idle=$((n_idle + 1)) ;; *) n_stop=$((n_stop + 1)) ;; esac
+      line+="$(dot "$r" word "$st")  "
+    done
+    ch=0; prs=""; tusd=0; ttok=0; tunk=0; models=""
+    for r in $(task_roles); do
+      a=0; b=0; br="$t"; [[ -f "$gitdir/$t.$r" ]] && read -r a b br < "$gitdir/$t.$r"
+      ch=$((ch + a)); prs+=$(pr_label "$r" "$br" "$b")
+      u=0; tk=0; k=0; m=-; e=-; [[ -f "$gitdir/$t.$r.use" ]] && read -r u tk k m e < "$gitdir/$t.$r.use"
+      tusd=$(awk -v a="$tusd" -v b="$u" 'BEGIN { printf "%.6f", a + b }'); ttok=$((ttok + tk)); tunk=$((tunk + k))
+      [[ "$m" != - ]] && models+="$r|$(model_short "$m")${e:+ $([[ "$e" != - ]] && echo "$e" || true)}"$'\n'
+    done
+    allusd=$(awk -v a="$allusd" -v b="$tusd" 'BEGIN { printf "%.6f", a + b }'); alltok=$((alltok + ttok))
+    dc=0
+    [[ "$dps" == off ]] || dc=$(awk -F'|' -v d="$WT_ROOT/$t/" -v p="$S" 'index($1 "/", d) == 1 || $2 == p' <<< "$dps" | grep -c . || true)
+    dmine=$((dmine + dc))
+    line+="${C_DIM}$(plural "$ch" "changed file")${C_RESET}"
+    if [[ $ttok -gt 0 ]]; then
+      line+=" · $(tokens_short "$ttok") tokens · ${C_BOLD}$(money "$tusd" "$rate")${C_RESET}$([[ $tunk -gt 0 ]] && echo "${C_DIM}+?${C_RESET}" || true)"
+      line+=" · ${C_DIM}$(model_list "$models")${C_RESET}"
+    fi
+    line+="$prs$([[ $dc -gt 0 ]] && echo "${C_DIM} · $(plural "$dc" container)${C_RESET}" || true)"
+    i=$((i + 1)); [[ $i -le 8 ]] && lines+="$line"$'\n'
+  done
+  rm -rf "$gitdir"
+  [[ $i -gt 8 ]] && lines+="${C_DIM}… and $((i - 8)) more open tasks under 2 Running agents${C_RESET}"$'\n'
+
+  local others; others=$(other_orgs_open)
+  [[ "$mode" == full ]] && printf '%s\n' "${C_BOLD}GitHub ${C_RESET}  ${C_BOLD}$ORG${C_RESET}${C_DIM} · o: switch${others:+ · also open: $others}${C_RESET}"
+  [[ "$mode" == full ]] && printf '%s\n' "${C_BOLD}Claude ${C_RESET}  $(claude_line)"
+  parts=""
+  [[ $n_need -gt 0 ]] && parts+="${C_YELLOW}${C_BOLD}$n_need $([[ $n_need -eq 1 ]] && echo needs || echo need) you${C_RESET} · "
+  [[ $n_work -gt 0 ]] && parts+="${C_GREEN}$n_work working${C_RESET} · "
+  [[ $n_idle -gt 0 ]] && parts+="$n_idle idle · "
+  [[ $n_stop -gt 0 ]] && parts+="${C_DIM}$n_stop stopped${C_RESET} · "
+  [[ "$mode" == full ]] && printf '%s\n' "${C_BOLD}Agents ${C_RESET}  ${parts:-${C_DIM}none running · }$(plural "$(count $open)" "open task")$([[ -n "$closed" ]] && echo " · $(count $closed) not open" || true)"
+  if [[ $alltok -gt 0 ]]; then
+    printf '%s\n' "${C_BOLD}Cost   ${C_RESET}  ${C_BOLD}$(money "$allusd" "$rate")${C_RESET} for $(tokens_short "$alltok") tokens on open tasks ${C_DIM}· estimate at API list prices, not your bill$([[ -n "$rate" ]] && echo " · 1 USD = $(awk -v r="$rate" 'BEGIN { printf "%.3f", r }') $CURRENCY" || true)${C_RESET}"
+  fi
+  if [[ "$mode" != full ]]; then :
+  elif [[ "$dps" == off ]]; then printf '%s\n' "${C_BOLD}Docker ${C_RESET}  ${C_DIM}not running${C_RESET}"
+  else
+    dall=$(grep -c . <<< "$dps" || true)
+    printf '%s\n' "${C_BOLD}Docker ${C_RESET}  $(plural "$dall" container) running · $dmine from these tasks"
+  fi
+  [[ "$mode" == full ]] && printf '%s\n' "${C_BOLD}Default${C_RESET}  ${C_DIM}Remote Control $REMOTE · layout $DEFAULT_LAYOUT · opens in: $DEFAULT_OPEN · $(plural "$(count $(all_roles))" agent) you can start${C_RESET}"
+  if [[ -n "$lines" ]]; then printf '\n%s' "$lines"; fi
+  if [[ "$mode" == full && -n "$closed" ]]; then
+    printf '%s\n' "${C_DIM}Not open: $(echo $closed | tr ' ' '\n' | head -n 4 | paste -sd, - | sed 's/,/, /g')$([[ $(count $closed) -gt 4 ]] && echo ", …" || true) · 3 resumes them${C_RESET}"
+  fi
+  gone=$(closed_unexpectedly)
+  [[ "$mode" == full && -n "$gone" ]] && printf '%s\n' "${C_YELLOW}Closed unexpectedly (Mac restart?): $(csv "$gone" | sed 's/,/, /g') · 3 resumes them all${C_RESET}"
+  merged=$(merged_tasks)
+  [[ -n "$merged" ]] && printf '%s\n' "${C_GREEN}Merged and clean: $(csv "$merged" | sed 's/,/, /g') · 5 removes them${C_RESET}"
+  [[ "$mode" == full ]] && printf '%s\n' "${C_DIM}Updated $(date +%H:%M:%S), every 10 seconds$([[ -f "$ORG_CACHE/prs.tsv" ]] && echo " · pull requests from $(stat -f %Sm -t %H:%M "$ORG_CACHE/prs.tsv")" || true) · r: refresh now${C_RESET}"
+  return 0
+}
+model_list() { # lines "agent|Model effort": one "Opus 5.5 medium" when all agree, else "be Opus 5.5 medium, ui Sonnet 5.5 high"
+  local uniq
+  uniq=$(printf '%s' "$1" | cut -d'|' -f2 | sort -u)
+  if [[ $(printf '%s\n' "$uniq" | grep -c .) -le 1 ]]; then printf '%s' "$uniq"
+  else printf '%s' "$1" | awk -F'|' 'NF == 2 { printf "%s%s %s", (n++ ? ", " : ""), $1, $2 }'; fi
+}
+pr_label() { # <agent> <branch> <commits>: " · be #123 ✓ checks pass" and the like
+  local pr n st ck c
+  pr=$(pr_of "$1" "$2")
+  if [[ -z "$pr" ]]; then
+    [[ "${3:-0}" -gt 0 ]] && printf '%s' " · ${C_DIM}$1: $(plural "$3" commit), no PR${C_RESET}"
+    return 0
+  fi
+  read -r n st ck <<< "$pr"
+  case "$st" in
+    MERGED) printf '%s' " · ${C_GREEN}$1 #$n merged${C_RESET}" ;;
+    CLOSED) printf '%s' " · ${C_DIM}$1 #$n closed${C_RESET}" ;;
+    *) case "$ck" in
+         pass)    c="${C_GREEN}✓ checks pass" ;;
+         fail)    c="${C_RED}✗ checks fail" ;;
+         pending) c="${C_YELLOW}… checks running" ;;
+         *)       c="${C_DIM}no checks" ;;
+       esac
+       printf '%s' " · $1 #$n $c${C_RESET}" ;;
+  esac
+}
+main_header() { # dashboard, then the menu title
+  local shown=""
+  [[ -n "${AA_SHOWN:-}" && -s "$AA_SHOWN" ]] && shown="$(cat "$AA_SHOWN")"$'\n'"${C_DIM}────────${C_RESET}"$'\n'
+  local dash
+  if [[ "${1:-}" == cached && -n "${AA_DASH:-}" && -s "$AA_DASH" ]]; then dash=$(cat "$AA_DASH")   # instant; the live refresh follows at once
+  else dash=$(dashboard); [[ -n "${AA_DASH:-}" ]] && printf '%s' "$dash" > "$AA_DASH"; fi
+  printf '%s%s\n\n%s\n%s\n' "$shown" "$dash" "${C_BOLD}What do you want to do?${C_RESET}" "${C_DIM}m: monitor · o: organisation · 1-8: jump · Enter: choose · r: refresh · q: quit${C_RESET}"
+}
+
+interactive() { # [monitor]
+  command -v fzf >/dev/null || die "the menu needs fzf: brew install fzf"
+  command -v tmux >/dev/null || die "the menu needs tmux: brew install tmux"
+  [[ -t 0 && -t 1 ]] || die "the menu needs a terminal; see: $PROG help"
+  local choice
+  NOTES=$(mktemp "${TMPDIR:-/tmp}/$PROG.XXXXXX")
+  export AA_AUTH="$NOTES.auth" AA_SHOWN="$NOTES.shown" AA_DASH="$NOTES.dash" AA_COLOR=1   # the live header renders in a child process
+  FZF_API_KEY=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n'); export FZF_API_KEY   # only our refresh loop may talk to fzf
+  : > "$AA_SHOWN"
+  trap 'rm -f "$NOTES" "$NOTES".*' EXIT
+  if [[ -n "$ORG_FROM_ENV" || ( "${1:-}" == monitor && -n "$ORG" ) ]]; then org_watchdogs
+  else flow_org quit || { top; return 0; }; fi
+  if [[ "${1:-}" == monitor ]]; then flow_monitor; top; return 0; fi   # the monitor on its own, e.g. in a side pane
+  while :; do
+    load_repos
+    if [[ -s "$NOTES" ]]; then cat "$NOTES" > "$AA_SHOWN"; : > "$NOTES"; fi   # the last result stays above the overview
+    if [[ -z "${AA_DASH:-}" || ! -s "$AA_DASH" ]]; then
+      loading "Loading the overview of ${ORG}" "Agents, costs, pull requests and Docker"; main_header > /dev/null; loaded
+    fi
+    live 10 "bg-transform-header($SELF _header)"
+    choice=$(printf '%s\n' "start${TAB}1  Start new agents" "running${TAB}2  Running agents" \
+      "resume${TAB}3  Resume agents" "repo${TAB}4  Add a repository" "remove${TAB}5  Remove agents" "tools${TAB}6  Skills, plugins and MCP servers" "monitor${TAB}7  Monitor: what every agent is doing" "org${TAB}8  Switch GitHub organisation" "quit${TAB}   Quit" |
+      PICK_HEADER="$(main_header cached)" NO_BACK=1 pick "" "" --no-input "${LIVE[@]}" \
+        --bind "r:bg-transform-header($SELF _header)" --bind 'esc:ignore,q:abort,j:down,k:up,1:pos(1)+accept,2:pos(2)+accept,3:pos(3)+accept,4:pos(4)+accept,5:pos(5)+accept,6:pos(6)+accept,7:pos(7)+accept,m:pos(7)+accept,8:pos(8)+accept,o:pos(8)+accept') || break
+    : > "$AA_SHOWN"
+    case "$choice" in
+      start)   flow_start ;;
+      running) flow_running ;;
+      resume)  flow_resume ;;
+      repo)    flow_add_repo ;;
+      remove)  flow_remove ;;
+      tools)   flow_inventory ;;
+      monitor) flow_monitor ;;
+      org)     flow_org "back" && : > "$AA_DASH" || true ;;
+      quit)    break ;;
+    esac
+  done
+  top; [[ -s "$NOTES" ]] && cat "$NOTES"; return 0   # leave the last result on screen
+}
+
+usage="usage: $PROG [--org owner] (no arguments: interactive menu) | orgs | org [owner] | up <task> [goal] [--only a,b] [--split|--own] [--remote on|off] [--window|--tab|--here|--detached] | start <task> a[,b] [--split|--own] [--fresh] [--remote on|off] [open] | stop <task> a[,b] | resume <task> [--only a,b] [--split|--own] [--fresh] [--remote on|off] [open] | attach <task> [open] | say <task> <agent> <msg> | ls | repos | add-repo <repo|path> [agent] [description] | remove <task> a[,b] [--force] | down <task> [--prune] | help"
+main() {
+  if [[ "${1:-}" == --org ]]; then [[ -n "${2:-}" ]] || die "--org needs a GitHub owner"; AA_ORG="$2"; ORG_FROM_ENV="$2"; shift 2; fi
+  resolve_org
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_inv|inventory|_usage|_activity|_hook|_notify) ;;
+    *) need_org ;;
+  esac
+  case "$cmd" in
+    "")
+      if [[ -t 0 && -t 1 && -z "${CLAUDECODE:-}" ]]; then interactive; else die "$usage"; fi ;;
+    menu) interactive ;;
+    monitor) interactive monitor ;;
+    monitor-pane) monitor_pane "${1:-}" ;;
+    _monitor) monitor_lines ;;
+    _monitor_header) monitor_header ;;
+    help|-h|--help) sed -n '2,/^set -euo/p' "$SELF" | sed -e '$d' -e 's/^# \{0,1\}//' ;;
+    up|resume|attach|down)
+      check_task "${1:-}"; use_task "$1"; shift; parse "$@"
+      case "$cmd" in up) up ;; resume) resume ;; attach) open_view "${OPEN:-here}" ;; down) down ;; esac ;;
+    start|stop|say|remove|restart)
+      check_task "${1:-}"; use_task "$1"
+      if [[ "$cmd" == say && "${2:-}" == all ]]; then ROLES=$(known_roles); ROLES="${ROLES% }"; [[ -n "$ROLES" ]] || die "task $TASK has no agents"
+      else ROLES=$(check_roles "${2:-}"); fi
+      shift 2
+      if [[ "$cmd" == say ]]; then
+        [[ $# -ge 1 ]] || die "usage: $PROG say <task> <agent>|a,b|all \"message\""; GOAL="$*"
+      else parse "$@"; fi
+      case "$cmd" in start) start ;; stop) stop ;; say) say ;; remove) remove ;; restart) restart ;; esac ;;
+    ls) list ;;
+    repos) repos ;;
+    add-repo) add_repo_cmd "$@" ;;
+    orgs)     owner_lines | while IFS=$'\t' read -r o d; do printf '%s %-24s %s\n' "$([[ "$o" == "$ORG" ]] && echo '*' || echo ' ')" "$o" "$d"; done ;;
+    org)      if [[ -n "${1:-}" ]]; then use_org "$1"; remember_org; echo "commands now work in $ORG"; else need_org; echo "$ORG"; fi ;;
+    _preview) preview "${1:-}" ;;
+    _header)  main_header ;;
+    _notify)  notify "$@" ;;
+    _hook)    hook "$@" >/dev/null 2>&1 </dev/stdin || true ;;
+    _watch)   watch "${1:?task}" ;;
+    _usage)    agent_usage "${1:?worktree}" ;;
+    _activity) activity_of "${1:?worktree}" ;;
+    _state)   check_task "${1:-}"; use_task "$1"; agent_state "${2:?agent}" ;;
+    resume-all) parse "$@"; resume_all ;;
+    selftest) exec bash "${AA_TESTS:-$(dirname "$(readlink -f "$SELF")")/tests.sh}" "$SELF" ;;   # tests.sh sits next to the real file
+    _prs)     pr_refresh ;;
+    _ticker)  ticker "$@" ;;
+    _feed)    feed "$@" ;;
+    _spin)    spin "$@" ;;
+    _agents)  agents_lines ;;
+    save-choice) check_task "${1:-}"; use_task "$1"; ROLES=$(check_roles "${2:-}"); shift 2; parse "$@"; save_choices "$ROLES" ;;
+    _inv)     inv_preview "${1:-}" ;;
+    inventory) inventory ;;
+    prs)      pr_refresh; cat "$ORG_CACHE/prs.tsv" 2>/dev/null || true ;;
+    *)  die "$usage" ;;
+  esac
+}
+
+# one line, so editing this file while a menu is open never makes the running copy read new text
+main "$@"; exit $?
