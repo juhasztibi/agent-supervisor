@@ -348,7 +348,7 @@ hook() { # <task> <agent> <event>: Claude Code calls this; it must stay quiet an
 }
 interrupted() { # <agent>: true when the newest session file ends with Claude Code's "interrupted" marker (you pressed Esc)
   local pdir f
-  pdir="$CLAUDE_PROJECTS/$(printf '%s' "$(wt_dir "$1")" | sed 's/[^A-Za-z0-9]/-/g')"
+  pdir="$(proj_dir "$(wt_dir "$1")")"
   f=$(ls -t "$pdir"/*.jsonl 2>/dev/null | head -n 1)
   [[ -n "$f" ]] && tail -n 3 "$f" | grep -q 'Request interrupted by user'
 }
@@ -412,7 +412,7 @@ watch_agent() { # <agent>: restart a crashed agent, alert when it looks stuck or
   case "$ST" in
     working)
       last="$ST_T"
-      n=$(ls -t "$CLAUDE_PROJECTS/$(printf '%s' "$(wt_dir "$r")" | sed 's/[^A-Za-z0-9]/-/g')"/*.jsonl 2>/dev/null | head -n 1)
+      n=$(ls -t "$(proj_dir "$(wt_dir "$r")")"/*.jsonl 2>/dev/null | head -n 1)
       [[ -n "$n" ]] && n=$(stat -f %m "$n") && [[ "$n" -gt "$last" ]] && last="$n"
       if [[ $((now - last)) -gt $STUCK_SEC && "$ST_D" != *"[alerted]" ]]; then
         set_state "$r" working "$ST_D [alerted]" "$ST_T"; watch_log "$r working without a step for $(( (now - last) / 60 )) min"
@@ -666,7 +666,7 @@ launch() { # <agent> <fresh|continue>
   set_state "$1" starting "launched"
   # continue the agent's last conversation in its worktree; start fresh only when there is none
   # (not "--continue || fresh": after a crash that would silently throw the conversation away)
-  if [[ "$2" == continue ]] && ls "$CLAUDE_PROJECTS/$(printf '%s' "$(wt_dir "$1")" | sed 's/[^A-Za-z0-9]/-/g')"/*.jsonl >/dev/null 2>&1; then
+  if [[ "$2" == continue ]] && ls "$(proj_dir "$(wt_dir "$1")")"/*.jsonl >/dev/null 2>&1; then
     tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG; claude ${rc}--continue --name $name" Enter
   else
     tmux send-keys -t "$p" "unset CLAUDECODE; export AA_ORG=$ORG; claude ${rc}--name $name \"\$(cat $prompt)\"" Enter
@@ -836,6 +836,10 @@ repos() {
   echo "(added repos live in $REPOS_FILE)"
 }
 
+proj_dir() { # <worktree>: Claude Code's folder for its sessions, named after the physical path (symlinks resolved)
+  local d; d=$(cd "$1" 2>/dev/null && pwd -P) || d="$1"
+  printf '%s/%s' "$CLAUDE_PROJECTS" "$(printf '%s' "$d" | sed 's/[^A-Za-z0-9]/-/g')"
+}
 canon() { (cd "$1" 2>/dev/null && pwd -P); }
 path_problem() { # <path>: prints why the repo can't be added, or nothing
   local p="$1" top r rp
@@ -1089,7 +1093,7 @@ prices_json() { # the default prices, with $CONFIG_DIR/prices.json on top
 agent_usage() { # <worktree>: "<usd> <tokens> <replies without a price> <model> <effort>" over all its sessions and subagents
   local pdir f st c line u t k m e lt usd=0 tok=0 unk=0 model=- effort=- ts=""
   command -v jq >/dev/null || { echo "0 0 0 - -"; return 0; }
-  pdir="$CLAUDE_PROJECTS/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+  pdir="$(proj_dir "$1")"
   [[ -d "$pdir" ]] || { echo "0 0 0 - -"; return 0; }
   mkdir -p "$CACHE_DIR/usage"
   while IFS= read -r f; do
@@ -1213,7 +1217,7 @@ JQ_TOOLS='
 agent_tools() { # <worktree>: "kind<TAB>name<TAB>times" summed over all its sessions and subagents
   local pdir f st c
   command -v jq >/dev/null || return 0
-  pdir="$CLAUDE_PROJECTS/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+  pdir="$(proj_dir "$1")"
   [[ -d "$pdir" ]] || return 0
   mkdir -p "$CACHE_DIR/tools"
   while IFS= read -r f; do
@@ -1304,7 +1308,7 @@ def tool:
 | @tsv'
 activity_of() { # <worktree>: what its agent is doing, from the newest main session file
   local pdir f
-  pdir="$CLAUDE_PROJECTS/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+  pdir="$(proj_dir "$1")"
   f=$(ls -t "$pdir"/*.jsonl 2>/dev/null | head -n 1)
   [[ -n "$f" ]] || return 0
   tail -n 400 "$f" | jq -rn --arg wt "$1" "$JQ_ACTIVITY" 2>/dev/null || true
