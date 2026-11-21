@@ -47,6 +47,7 @@
 #   remove <task> a[,b] [--force]                                                stop agents and delete their panes and worktrees
 #                                                                                (all agents: the whole task; --force drops uncommitted changes)
 #   resume-all [open]                                                            resume every task that closed unexpectedly (crash, Mac restart)
+#   next   [pane]                                                                go to the agent that has waited longest for you (prefix + J)
 #   down   <task> [--prune]                                                      stop everything and clean docker
 #                                                                                (--prune also removes clean worktrees)
 #   menu                                                                         the interactive menu
@@ -457,6 +458,36 @@ watch() { # <task>: the loop; it ends when the task's tmux session is gone
     sleep "$WATCH_SEC"
   done
   rm -f "$WT_ROOT/$TASK/.watch.pid"
+}
+
+# ---- jump to the agent that waits for you (tmux: prefix + J) ----
+waiting_agents() { # agents of every organisation that ask you something, oldest wait first: "since<TAB>pane<TAB>task<TAB>agent<TAB>what"
+  local d s r
+  for d in "$CONFIG_DIR"/orgs/*/; do
+    [[ -d "$d" ]] || continue
+    ( use_org "$(basename "$d")"
+      for s in $(open_sessions); do
+        use_task "${s#"$PREFIX-"}"
+        for r in $(known_roles); do
+          [[ "$(agent_state "$r")" == needs-you ]] || continue
+          read_state "$r"; printf '%s\t%s\t%s\t%s\t%s\n' "${ST_T:-0}" "$(agent_pane "$r")" "$TASK" "$r" "${ST_D% \[reminded\]}"
+        done
+      done )
+  done | sort -n | awk -F'\t' '$2 != "" && !seen[$2]++'
+}
+next_agent() { # [pane you are in] [--print]: the agent that has waited longest for you; from that agent, the next one
+  local cur="" print="" a list t n since pane task r what
+  for a in "$@"; do if [[ "$a" == --print ]]; then print=1; else cur="$a"; fi; done
+  list=$(waiting_agents); n=$(grep -c . <<< "$list" || true)
+  if [[ -z "$list" ]]; then
+    if [[ -n "$print" ]]; then echo "Nobody is waiting for you"; else tmux display-message "Nobody is waiting for you"; fi
+    return 0
+  fi
+  t=$(awk -F'\t' -v c="$cur" 'NR == 1 { first = $0 } hit && t == "" { t = $0 } $2 == c { hit = 1 } END { print (t != "" ? t : first) }' <<< "$list")
+  IFS=$'\t' read -r since pane task r what <<< "$t"
+  if [[ -n "$print" ]]; then printf '%s\t%s\t%s\t%s\n' "$pane" "$task" "$r" "$what"; return 0; fi
+  tmux select-window -t "$pane" \; select-pane -t "$pane" \; switch-client -t "$pane"
+  tmux display-message "$task · $r waits for you since $(age_of_epoch "$since"): ${what:-a question}$([[ $n -gt 1 ]] && echo "  ($n waiting, prefix + J for the next)" || true)"
 }
 
 # ---- tasks that were open when the Mac restarted or tmux died ----
@@ -2695,7 +2726,7 @@ main() {
   resolve_org
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_listen|_inv|inventory|_usage|_activity|_hook|_notify) ;;
+    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_listen|next|_inv|inventory|_usage|_activity|_hook|_notify) ;;
     *) need_org ;;
   esac
   case "$cmd" in
@@ -2731,6 +2762,7 @@ main() {
     _header)  main_header ;;
     _notify)  notify "$@" ;;
     _hook)    hook "$@" 3>&1 >/dev/null 2>&1 </dev/stdin || true ;;   # only a decision (fd 3) reaches Claude Code
+    next)     next_agent "$@" ;;
     _listen)  rc=0; listen "${1:?task}" "${2:?agent}" 3>&2 >/dev/null 2>&1 </dev/stdin || rc=$?; exit "$rc" ;;   # only the messages reach stderr
     _watch)   watch "${1:?task}" ;;
     _usage)    agent_usage "${1:?worktree}" ;;
