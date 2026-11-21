@@ -394,6 +394,37 @@ has "and you are told" "t12 merged" "$(cat "$OSA_LOG")"
 has "the branches stay" "t12" "$(git -C "$T/repos/api" branch --list t12)"
 rm -f "$C"
 
+section "Screens"
+"$A" up t13 --only be,ui --goal x >/dev/null 2>&1
+wait_for 5 running t13 ui && wait_for 5 grep -q idle "$W/t13/ui.state"
+printf 'needs-you\t%s\tBash: git push\n' "$(( $(date +%s) - 60 ))" > "$W/t13/be.state"
+printf 'idle\t%s\tfinished its turn\n' "$(( $(date +%s) - 120 ))" > "$W/t13/ui.state"
+out=$("$A" status); has "the tmux status line counts who needs you" "◆ 1 needs you" "$out"; has "and who is done" "✓ 1 done" "$out"
+has "with tmux colours" "#\[fg=" "$out"
+out=$(AA_COLOR= "$A" _monitor); has "an agent that just finished shows done" "ui    done 2m" "$out"
+printf 'idle\t%s\tfinished its turn\n' "$(( $(date +%s) - 7300 ))" > "$W/t13/ui.state"
+out=$(AA_COLOR= "$A" _monitor); has "long after, it shows idle with its age" "ui    idle 2h" "$out"
+mkdir -p "$(projdir t13 web)"
+printf '%s\n' '{"type":"assistant","timestamp":"2030-01-01T00:00:00.000Z","message":{"id":"m9","model":"claude-opus-5-5","content":[{"type":"text","text":"I posted **the comment** on [#3769](https://github.com/o/r/issues/3769#issuecomment-1) and `fixed` it"}]}}' > "$(projdir t13 web)/s.jsonl"
+out=$("$A" _activity "$W/t13/web"); has "links and formatting are removed from activity" "I posted the comment on #3769 and fixed it" "$out"
+long="one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen"
+printf '%s\n' "{\"type\":\"assistant\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"message\":{\"id\":\"m10\",\"model\":\"claude-opus-5-5\",\"content\":[{\"type\":\"text\",\"text\":\"$long $long $long\"}]}}" > "$(projdir t13 web)/s.jsonl"
+printf 'idle\t%s\tfinished its turn\n' "$(( $(date +%s) - 60 ))" > "$W/t13/ui.state"
+out=$(FZF_COLUMNS=90 AA_COLOR= "$A" _monitor | grep 'ui ')
+has "long text is cut at a word with …" "[a-z]…$" "$out"
+eq "and fits the width" "1" "$(awk -v w=90 '{ if (length($0) <= w) print 1; else print 0 }' <<< "$(cut -f2- <<< "$out")" | sort -u | tr -d '\n')"
+hasnt "a narrow screen drops model and cost first" "CHF" "$(FZF_COLUMNS=90 AA_COLOR= "$A" _monitor | grep 'ui ')"
+AA_TASK=t13 AA_AGENT=be "$A" send ui "status field is ready" >/dev/null
+out=$(AA_COLOR= "$A" _monitor); has "the monitor lists recent events" "Recent events" "$out"; has "such as messages" "be → ui: status field is ready" "$out"
+out=$(AA_COLOR= "$A" _header); first=$(grep -n 't13' <<< "$out" | head -1 | cut -d: -f1); claude=$(grep -n 'Claude' <<< "$out" | head -1 | cut -d: -f1)
+[[ -n "$first" && -n "$claude" && $first -lt $claude ]] && ok "the overview shows tasks before the setup lines" || bad "the overview shows tasks before the setup lines" "$out"
+eq "a light terminal gets the light theme" "light" "$(COLORFGBG='0;15' "$A" _theme)"
+eq "a dark terminal the dark one" "dark" "$(COLORFGBG='15;0' "$A" _theme)"
+printf 'idle\ta[$(touch %s)]\tfinished its turn\n' "$T/pwned" > "$W/t13/ui.state"
+AA_COLOR= "$A" _monitor >/dev/null 2>&1; "$A" status >/dev/null 2>&1; "$A" next --print >/dev/null 2>&1
+check "a crafted state file never runs a command" test ! -e "$T/pwned"
+"$A" down t13 --prune >/dev/null 2>&1
+
 section "Overlap between tasks"
 "$A" up t8 --only be --goal x >/dev/null 2>&1; "$A" up t9 --only be --goal y >/dev/null 2>&1
 echo a > "$W/t8/api/shared.txt"; git -C "$W/t8/api" add shared.txt

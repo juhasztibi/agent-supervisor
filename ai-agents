@@ -49,6 +49,7 @@
 #   resume-all [open]                                                            resume every task that closed unexpectedly (crash, Mac restart)
 #   finish <task>                                                                every agent pushes and opens its pull request; the PRs get
 #                                                                                linked, and the task is removed once all are merged
+#   status                                                                       one line for the tmux status bar: who needs you, works, is done
 #   next   [pane]                                                                go to the agent that has waited longest for you (prefix + J)
 #   down   <task> [--prune]                                                      stop everything and clean docker
 #                                                                                (--prune also removes clean worktrees)
@@ -106,7 +107,8 @@ STUCK_SEC="${AA_STUCK_SEC:-1200}"                         # "working" without a 
 DELIVER_SEC="${AA_DELIVER_SEC:-120}"                      # tell you when a message to a running agent is still not delivered after this long
 ANSWER_SEC="${AA_ANSWER_SEC:-900}"                        # tell you when a question between agents is unanswered this long
 WAIT_SEC="${AA_WAIT_SEC:-1800}"                           # tell you when an agent waits for another one this long
-REMIND_SEC="${AA_REMIND_SEC:-600}"                        # remind once when an agent waits for you this long
+REMIND_SEC="${AA_REMIND_SEC:-600}"
+DONE_SEC="${AA_DONE_SEC:-3600}"                            # an agent that finished its turn shows "done" this long, then "idle"                        # remind once when an agent waits for you this long
 
 die() { echo "$PROG: $*" >&2; exit 1; }
 [[ "$DEFAULT_LAYOUT" == own || "$DEFAULT_LAYOUT" == split ]] || die "AA_LAYOUT must be own or split"
@@ -327,6 +329,7 @@ set_state() { # <agent> <state> <detail> [since]
 read_state() { # <agent>: sets ST, ST_T, ST_D (empty when no hook has reported yet)
   ST=""; ST_T=0; ST_D=""
   [[ -f "$(state_file "$1")" ]] && IFS=$'\t' read -r ST ST_T ST_D < "$(state_file "$1")" || true
+  [[ "$ST_T" =~ ^[0-9]+$ ]] || ST_T=0   # agents can write this file: never let bash evaluate it as arithmetic
 }
 hook() { # <task> <agent> <event>: Claude Code calls this; it never fails, and prints only a decision, on fd 3
   local event="$3" input tool="" what="" msg="" kind="" mail
@@ -416,7 +419,8 @@ watch_agent() { # <agent>: restart a crashed agent, alert when it looks stuck or
     case "$ST" in
       starting) [[ $((now - ST_T)) -gt 120 ]] && { set_state "$r" crashed "did not start"; watch_log "$r did not start"; notify_text "$title did not start" "" "Start it again from the menu."; } ;;
       idle|working|needs-you)   # it was alive and ended without saying so: a crash
-        [[ $((now - $(cat "$WT_ROOT/$TASK/$r.stopping" 2>/dev/null || echo 0))) -lt 60 ]] && return 0   # being stopped right now
+        f=$(cat "$WT_ROOT/$TASK/$r.stopping" 2>/dev/null || true); [[ "$f" =~ ^[0-9]+$ ]] || f=0   # digits only, as above
+        [[ $((now - f)) -lt 60 ]] && return 0   # being stopped right now
         f="$WT_ROOT/$TASK/$r.restarts"
         recent=$(awk -v n="$now" '$1 > n - 3600' "$f" 2>/dev/null | grep -c . || true)
         if [[ "$AUTO_RESTART" == on && "$recent" -lt 3 ]]; then
@@ -461,6 +465,27 @@ watch() { # <task>: the loop; it ends when the task's tmux session is gone
     sleep "$WATCH_SEC"
   done
   rm -f "$WT_ROOT/$TASK/.watch.pid"
+}
+
+# ---- one line for the tmux status bar (status-right: #(ai-agents status)) ----
+tmux_status() { # "◆ 1 needs you · ● 2 working · ✓ 1 done" over every organisation, in tmux colours; nothing without agents
+  local c="$CACHE_DIR/status" d s a b e need=0 work=0 ndone=0 out=""
+  if [[ -f "$c" && -n "$(find "$c" -mtime -4s 2>/dev/null)" ]]; then cat "$c"; return 0; fi   # several clients ask at once
+  for d in "$CONFIG_DIR"/orgs/*/; do
+    [[ -d "$d" ]] || continue
+    read -r a b e <<< "$( use_org "$(basename "$d")"; n1=0; n2=0; n3=0
+      for s in $(open_sessions); do use_task "${s#"$PREFIX-"}"
+        for r in $(known_roles); do
+          case "$(view_state "$r")" in (needs-you) n1=$((n1 + 1)) ;; (working) n2=$((n2 + 1)) ;; (done) n3=$((n3 + 1)) ;; esac   # "(": bash 3.2 inside $( )
+        done
+      done; echo "$n1 $n2 $n3" )"
+    need=$((need + a)); work=$((work + b)); ndone=$((ndone + e))
+  done
+  [[ $need -gt 0 ]] && out+="#[fg=yellow,bold]◆ $need $([[ $need -eq 1 ]] && echo needs || echo need) you#[default] "
+  [[ $work -gt 0 ]] && out+="#[fg=green]● $work working#[default] "
+  [[ $ndone -gt 0 ]] && out+="#[fg=green]✓ $ndone done#[default] "
+  mkdir -p "$CACHE_DIR"; printf '%s\n' "${out% }" > "$c.$$" && mv "$c.$$" "$c"
+  cat "$c"
 }
 
 # ---- jump to the agent that waits for you (tmux: prefix + J) ----
@@ -774,6 +799,7 @@ mail_watch() { # the watchdog: tells you what can't be delivered, what stays una
   now=$(date +%s)
   while IFS=$'\t' read -r id t from to kind ref sha br st d _ al text; do
     [[ -n "$id" ]] || continue
+    [[ "$t" =~ ^[0-9]+$ ]] || t=$now; [[ "$d" =~ ^[0-9]+$ ]] || d=$now   # agents can write this file: digits only
     if [[ "$st" == queued && $((now - t)) -ge $DELIVER_SEC ]]; then
       if is_running "$to"; then
         if [[ "$al" != undelivered && "$(agent_state "$to")" != needs-you ]]; then
@@ -1613,7 +1639,8 @@ inv_preview() { # <ref>: details for one row; never prints MCP env vars or heade
 # activity_of prints "kind<TAB>text<TAB>time": kind is tool (a tool call that hasn't returned yet),
 # thinking (Claude works on a tool result or your message), said (its turn ended with this text).
 JQ_ACTIVITY='
-def line: tostring | gsub("[\r\n\t]+"; " ") | .[0:160];
+def line: tostring | gsub("\\[(?<t>[^\\]]*)\\]\\([^)]*\\)"; "\(.t)") | gsub("\\*\\*|__|`"; "") | gsub("(^|\\n)#+ +"; " ")
+  | gsub("[\r\n\t]+"; " ") | gsub("  +"; " ") | ltrimstr(" ") | .[0:300];
 def rel: if type == "string" then (if startswith($wt + "/") then .[($wt | length) + 1:] else . end) else "" end;
 def tool:
   if .name == "Bash" then "Bash: " + ((.input.description // .input.command // "") | line)
@@ -1656,6 +1683,14 @@ age_of() { # <ISO time>: "now", "4m", "2h", "3d"
   if [[ $s -lt 60 ]]; then echo now; elif [[ $s -lt 3600 ]]; then echo "$((s / 60))m"
   elif [[ $s -lt 86400 ]]; then echo "$((s / 3600))h"; else echo "$((s / 86400))d"; fi
 }
+screen_cols() { local c="${FZF_COLUMNS:-}"; [[ -n "$c" ]] || c=$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f2); echo "${c:-120}"; }
+fit() { # <text> <width>: cut at a word boundary with "…" when longer
+  local t="$1" w="$2"
+  [[ $w -gt 8 ]] || w=8
+  if [[ ${#t} -le $w ]]; then printf '%s' "$t"; return 0; fi
+  t="${t:0:$((w - 1))}"; [[ "$t" == *" "* ]] && t="${t% *}"
+  printf '%s…' "${t%[ ,.;:]}"
+}
 git_counts_cached() { # <worktree>: git_counts, reused for 15 seconds (the Monitor refreshes every 3)
   local c
   c="$CACHE_DIR/git/$(md5 -q -s "$1")"
@@ -1667,6 +1702,7 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
   # raw gives "state<TAB>agent<TAB>age<TAB>usd" per agent, for the header
   local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop n_wait wt_on ov ch prs tusd ttok models a b br
   [[ "${1:-}" == raw ]] || MON_RATE=$(usd_rate)
+  local cols vst plain col pre; cols=$(screen_cols)
   for s in $(open_sessions); do
     use_task "${s#"$PREFIX-"}"
     trank=9; n_need=0; n_work=0; n_idle=0; n_stop=0; n_wait=0; ch=0; prs=""; tusd=0; ttok=0; models=""
@@ -1684,7 +1720,7 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
                    elif [[ "$kind" == tool ]]; then text="wants to run: $text"; fi
                    text="${C_YELLOW}$text${C_RESET}" ;;
         working)   rank=2; n_work=$((n_work + 1)) ;;
-        idle)      rank=3; n_idle=$((n_idle + 1)); [[ "$kind" == said ]] && text="said: $text"; text="${C_DIM}$text${C_RESET}" ;;
+        idle)      rank=3; n_idle=$((n_idle + 1)); [[ "$kind" == said ]] && text="said: $text" ;;
         crashed)   rank=1; n_stop=$((n_stop + 1)); text="${C_RED}stopped unexpectedly; start it from its actions${C_RESET}"; age="" ;;
         *)         rank=4; n_stop=$((n_stop + 1)); text=""; age="" ;;
       esac
@@ -1692,6 +1728,8 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
       if [[ -n "$wt_on" && "$st" == idle ]]; then n_wait=$((n_wait + 1)); text="${C_YELLOW}⧗ waiting for ${wt_on%%$TAB*}: ${wt_on#*$TAB}${C_RESET}"
       elif [[ "$st" == idle ]]; then wt_on=$(open_question "$r"); [[ -z "$wt_on" ]] || text="${C_YELLOW}? question from ${wt_on%%$TAB*}: ${wt_on#*$TAB}${C_RESET}"; fi
       [[ $rank -lt $trank ]] && trank=$rank
+      vst=$(view_state "$r" "$st")   # the state word carries its age; agents without state hooks keep their activity's age
+      [[ ( "$vst" == "done" || "$vst" == idle ) && -n "$(state_age "$r")" ]] && age=""
       info=""
       if [[ "${tk:-0}" -gt 0 ]]; then
         info="$(model_short "$m")$([[ "$e" != - ]] && echo " $e" || true) · $(money "$u" "$MON_RATE")"
@@ -1702,7 +1740,14 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
         a=0; b=0; br="$TASK"; read -r a b br <<< "$(git_counts_cached "$(wt_dir "$r")")"
         ch=$((ch + ${a:-0})); prs+=$(pr_label "$r" "$br" "${b:-0}")
       fi
-      rows+="$TASK$TAB$rank$TAB$TASK|$r$TAB      $(dot "$r" word "$st") $(printf '%-4s' "$age") ${C_DIM}$(printf '%-24s' "$info")${C_RESET} $text"$'\n'
+      # columns that fit: model and cost go first on a narrow screen, the activity is cut at a word
+      plain=$(printf '%s' "$text" | sed $'s/\e\\[[0-9;]*m//g'); col="${C_YELLOW}"; [[ "$text" == "$plain" ]] && col=""
+      [[ "$st" == idle ]] && col="${C_DIM}"
+      if [[ $cols -ge 120 ]]; then pre="      $(printf '%-5s' "$r") $(printf '%-9s' "x") $(printf '%-4s' "$age") $(printf '%-24s' "$info") "
+        rows+="$TASK$TAB$rank$TAB$TASK|$r$TAB      $(dot "$r" word "$st") $(printf '%-4s' "$age") ${C_DIM}$(printf '%-24s' "$info")${C_RESET} $col$(fit "$plain" $((cols - ${#pre} - 4)))${C_RESET}"$'\n'
+      else pre="      $(printf '%-5s' "$r") $(printf '%-9s' "x") $(printf '%-4s' "$age") "
+        rows+="$TASK$TAB$rank$TAB$TASK|$r$TAB      $(dot "$r" word "$st") $(printf '%-4s' "$age") $col$(fit "$plain" $((cols - ${#pre} - 4)))${C_RESET}"$'\n'
+      fi
     done
     [[ "${1:-}" == raw ]] && continue
     head="${C_BOLD}$TASK${C_RESET}  "
@@ -1724,6 +1769,32 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
   # tasks by their most urgent agent, then by name; inside a task its own row first, then its agents
   printf '%s\n' "$BACK_LINE"
   printf '%s' "$rows" | grep . | sort -s -t"$TAB" -k1,1n -k2,2 -k3,3n | cut -f4-
+  events_lines 8 "$cols"
+}
+events_lines() { # <how many> <width>: the newest events of the open tasks: messages, restarts, handoffs, linked PRs
+  local n="$1" cols="$2" s f ev="" line t tm task text
+  for s in $(open_sessions); do
+    use_task "${s#"$PREFIX-"}"
+    f=$(mail_file "$TASK")
+    [[ -s "$f" ]] && ev+=$(awk -F'\t' -v task="$TASK" '{
+        what = ($5 == "handoff") ? $3 " → " $4 " handoff: " : ($5 == "question") ? $3 " asked " $4 ": " : ($5 == "reply") ? $3 " answered " $4 ": " : ($5 == "wait") ? $3 " waits for " $4 ": " : $3 " → " $4 ": "
+        printf "%s\t%s\t%s%s\n", $2, task, what, $13 }' "$f" | tail -n "$n")$'\n'
+    if [[ -s "$WT_ROOT/$TASK/watchdog.log" ]]; then
+      while IFS= read -r line; do
+        t=$(date -j -f '%Y-%m-%d %H:%M:%S' "${line:0:19}" +%s 2>/dev/null) || continue
+        ev+="$t$TAB$TASK$TAB${line:20}"$'\n'
+      done < <(tail -n "$n" "$WT_ROOT/$TASK/watchdog.log")
+    fi
+  done
+  ev=$(printf '%s' "$ev" | grep . | sort -t"$TAB" -k1,1nr | head -n "$n") || true
+  [[ -n "$ev" ]] || return 0
+  printf '__evh\t%s\n' " "
+  printf '__evh2\t%s\n' "${C_BOLD}Recent events${C_RESET}"
+  n=0
+  while IFS=$'\t' read -r t task text; do
+    n=$((n + 1)); tm=$(date -r "$t" +%H:%M)
+    printf '__ev%s\t%s\n' "$n" "${C_DIM}$tm  $(printf '%-12s' "$task") $(fit "$text" $((cols - 26)))${C_RESET}"
+  done <<< "$ev"
 }
 
 # ---- GitHub issues for "New task from a GitHub issue" ----
@@ -1790,10 +1861,23 @@ if [[ -t 1 || -n "${AA_COLOR:-}" ]]; then
   C_RESET=$'\e[0m' C_BOLD=$'\e[1m' C_DIM=$'\e[2m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_RED=$'\e[31m' C_CYAN=$'\e[36m'
 fi
 TAB=$'\t'
+theme() { # light or dark: AA_THEME, else what the terminal says about its background (COLORFGBG), else dark
+  local t="${AA_THEME:-auto}" bg
+  if [[ "$t" == auto ]]; then
+    bg="${COLORFGBG##*;}"; t=dark
+    [[ "$bg" == 7 || "$bg" == 15 ]] && t=light
+  fi
+  echo "$t"
+}
+if [[ "$(theme)" == light ]]; then
+  FZF_COLORS='light,border:248,label:25:bold,header:238,footer:242,pointer:25,marker:28,hl:130,hl+:130,prompt:25,query:235'
+else
+  FZF_COLORS='border:244,label:110:bold,header:250,footer:244,pointer:110,marker:114,hl:179,hl+:179,prompt:110,query:255'
+fi
 FZF_OPTS=(--ansi --layout=reverse --height=~80% --min-height=14 --border=rounded
   --border-label=" $PROG " --border-label-pos=3 --info=hidden --pointer='▶' --marker='✓ ' --gutter=' '
-  --delimiter="$TAB" --with-nth=2.. --header-first --no-sort --cycle --no-separator
-  --color='border:244,label:110:bold,header:250,pointer:110,marker:114,hl:179,hl+:179,prompt:110,query:255')
+  --delimiter="$TAB" --with-nth=2.. --header-first --no-sort --cycle --no-separator --ellipsis='…'
+  --color="$FZF_COLORS")
 
 # The menu redraws from the top of the screen every time. Results and messages from the last action
 # are kept in NOTES and shown once, above the next screen's title.
@@ -1843,10 +1927,11 @@ pick() { # <title> <hint> [fzf args...]; reads "value<TAB>label" lines; prints t
     if [[ -n "${BACK_FIRST:-}" ]]; then items="$BACK_LINE${items:+$'\n'$items}"; else items="${items:+$items$'\n'}$BACK_LINE"; fi
   fi
   notes=$(take_notes); loaded; top
-  local header="${C_BOLD}${title}${C_RESET}"$'\n'"${C_DIM}${hint}${C_RESET}"
+  local header="${C_BOLD}${title}${C_RESET}" footer="${PICK_FOOTER:-$hint}" foot=()
   [[ -n "${PICK_HEADER:-}" ]] && header="$PICK_HEADER"
+  [[ -z "$footer" ]] || foot=(--footer="${C_DIM}${footer}${C_RESET}")   # key hints at the bottom
   out=$(printf '%s\n' "$items" | fzf "${FZF_OPTS[@]}" --header="${notes:+$notes$'\n'}$header"$'\n' \
-    --bind "$ON_ENTER" "$@") || return 1
+    ${foot[@]+"${foot[@]}"} --bind "$ON_ENTER" "$@") || return 1
   out=$(printf '%s\n' "$out" | cut -f1 | grep -vx "$BACK") || return 1
   printf '%s\n' "$out"
 }
@@ -1950,17 +2035,30 @@ agent_state() { # <agent>: working, needs-you, idle, stopped or crashed
   elif grep -q 'esc to interrupt' <<< "$screen"; then echo working
   else echo idle; fi
 }
-dot() { # <agent> [word] [state]: coloured state of one agent of the current task; "word" spells the state out
-  local st="${3:-}" name; name=$(printf '%-5s' "$1")
+view_state() { # <agent> [state]: the state as you see it: an idle agent is "done" for a while after it finished its turn
+  local st="${2:-}"
   [[ -n "$st" ]] || st=$(agent_state "$1")
+  if [[ "$st" == idle ]]; then
+    read_state "$1"
+    [[ "$ST" == idle && "$ST_D" == "finished its turn" && $(( $(date +%s) - ST_T )) -lt $DONE_SEC ]] && st="done"
+  fi
+  echo "$st"
+}
+state_age() { read_state "$1"; [[ "${ST_T:-0}" -gt 0 ]] && age_of_epoch "$ST_T" || true; }   # <agent>: since its last state change
+dot() { # <agent> [word] [state]: coloured state of one agent of the current task; "word" spells the state out
+  local st name w=""; name=$(printf '%-5s' "$1")
+  st=$(view_state "$1" "${3:-}")
+  case "$st" in done|idle) [[ -z "${2:-}" ]] || w=$(printf '%-9s' "$st $(state_age "$1")") ;; esac
   case "$st" in
     working)   printf '%s' "${C_GREEN}●${C_RESET} $name${2:+ ${C_GREEN}working  ${C_RESET}}" ;;
     needs-you) printf '%s' "${C_YELLOW}◆${C_RESET} $name${2:+ ${C_YELLOW}${C_BOLD}needs you${C_RESET}}" ;;
-    idle)      printf '%s' "${C_CYAN}●${C_RESET} $name${2:+ ${C_DIM}idle     ${C_RESET}}" ;;
+    done)      printf '%s' "${C_GREEN}✓${C_RESET} $name${2:+ ${C_GREEN}$w${C_RESET}}" ;;
+    idle)      printf '%s' "${C_DIM}● $name${2:+ $w}${C_RESET}" ;;
     crashed)   printf '%s' "${C_RED}✗${C_RESET} $name${2:+ ${C_RED}crashed  ${C_RESET}}" ;;
     *)         printf '%s' "${C_DIM}○ $name${2:+ stopped  }${C_RESET}" ;;
   esac
 }
+LEGEND="◆ needs you  ● working  ✓ done  ● idle  ○ stopped  ✗ crashed  ⧗ waits for an agent  ⚠ overlap"
 all_tasks() { # tasks with worktrees or a tmux session, newest first
   { if [[ -d "$WT_ROOT" ]]; then ls -t "$WT_ROOT"; fi; tmux ls -F '#S' 2>/dev/null | sed -n "s/^$PREFIX-//p"; } |
     grep -E '^[a-z0-9][a-z0-9_-]*$' | awk '!seen[$0]++' |
@@ -2211,7 +2309,7 @@ flow_running() {
     live_feed 3 "reload(@@)+refresh-preview" _agents
     sel=$(printf '%s\n' "$lines" | NO_BACK=1 pick "Running agents" "Live view on the right, updates every 3 seconds · Enter: actions · Type to search" \
       --height=90% --track --id-nth=1 "${LIVE[@]}" --preview "[ {1} = $BACK ] || $SELF_Q _preview {1}" \
-      --preview-window='right,60%,follow,border-left,<50(down,55%,follow,border-top)') || return 0
+      --preview-window='right,50%,follow,border-left,<50(down,55%,follow,border-top)') || return 0
     task="${sel%%|*}"; role="${sel#*|}"
     agent_actions "$task" "$role" || return 0
   done
@@ -2359,8 +2457,9 @@ agent_inventory() { # <task> <agent>: what this agent used, then what only its r
   done
 }
 
+monitor_done_count() { local s r n=0; for s in $(open_sessions); do use_task "${s#"$PREFIX-"}"; for r in $(known_roles); do [[ "$(view_state "$r")" == "done" ]] && n=$((n + 1)); done; done; echo "$n"; }
 monitor_header() { # the top of the Monitor: who waits for you and since when, totals, merged tasks
-  local rows need="" n_need=0 n_work=0 n_idle=0 n_stop=0 st who age u usd=0 rate merged
+  local rows need="" n_need=0 n_work=0 n_idle=0 n_stop=0 n_done=0 st who age u usd=0 rate merged
   rows=$(monitor_lines raw); rate=$(usd_rate)
   while IFS=$'\t' read -r st who age u; do
     [[ -n "$st" ]] || continue
@@ -2370,13 +2469,13 @@ monitor_header() { # the top of the Monitor: who waits for you and since when, t
       working) n_work=$((n_work + 1)) ;; idle) n_idle=$((n_idle + 1)) ;; stopped) n_stop=$((n_stop + 1)) ;;
     esac
   done <<< "$rows"
+  n_done=$(monitor_done_count)
   if [[ $n_need -gt 0 ]]; then printf '%s\n' "${C_BOLD}Now    ${C_RESET}  ${C_YELLOW}${C_BOLD}waiting for you: ${need%, }${C_RESET}"
   else printf '%s\n' "${C_BOLD}Now    ${C_RESET}  ${C_GREEN}nobody is waiting for you${C_RESET}"; fi
-  printf '%s\n' "${C_BOLD}Agents ${C_RESET}  ${C_GREEN}$n_work working${C_RESET} · $n_idle idle · ${C_DIM}$n_stop stopped${C_RESET} · ${C_BOLD}$(money "$usd" "$rate")${C_RESET} so far ${C_DIM}(estimate at API list prices, not your bill)${C_RESET}"
+  printf '%s\n' "${C_BOLD}Agents ${C_RESET}  ${C_GREEN}$n_work working${C_RESET}$([[ $n_done -gt 0 ]] && echo " · ${C_GREEN}✓ $n_done done${C_RESET}" || true) · $((n_idle - n_done)) idle · ${C_DIM}$n_stop stopped${C_RESET} · ${C_BOLD}$(money "$usd" "$rate")${C_RESET} so far ${C_DIM}(estimate at API list prices, not your bill)${C_RESET}"
   merged=$(merged_tasks)
   [[ -n "$merged" ]] && printf '%s\n' "${C_GREEN}Merged and clean: $(csv "$merged" | sed 's/,/, /g') · remove them from the overview with 5${C_RESET}"
-  printf '\n%s\n%s\n' "${C_BOLD}Monitor${C_RESET} ${C_DIM}· by task · updated $(date +%H:%M:%S)${C_RESET}" \
-    "${C_DIM}Tasks that need you first · age = time since the agent's last step · Enter: actions · ?: live view · Esc or ← Back: overview${C_RESET}"
+  printf '\n%s\n' "${C_BOLD}Monitor${C_RESET} ${C_DIM}· by task, those that need you first · updated $(date +%H:%M:%S)${C_RESET}"
   return 0
 }
 
@@ -2410,11 +2509,12 @@ flow_monitor() { # all agents on one screen, refreshed every 3 seconds; Enter op
     # opens at once; the first refresh fills it in a moment later
     lines="$BACK_LINE"$'\n'"__loading${TAB}${C_DIM}Loading what every agent is doing…${C_RESET}"
     live_feed 3 "reload(@@)" _monitor 10 "transform-header(@@)" _monitor_header
-    sel=$(printf '%s\n' "$lines" | PICK_HEADER="${C_BOLD}Monitor${C_RESET}"$'\n'"${C_DIM}Loading…${C_RESET}" NO_BACK=1 pick "" "" \
+    sel=$(printf '%s\n' "$lines" | PICK_HEADER="${C_BOLD}Monitor${C_RESET}"$'\n'"${C_DIM}Loading…${C_RESET}" \
+      PICK_FOOTER="${C_DIM}$LEGEND"$'\n'"Enter: actions · ?: live view · type to search · age: since the last step · Esc or ← Back: overview${C_RESET}" NO_BACK=1 pick "" "" \
       --height=100% --track --id-nth=1 "${LIVE[@]}" --bind '?:toggle-preview' \
-      --preview "case {1} in $BACK|__loading|*'|') echo 'Pick an agent to see its screen.' ;; *) $SELF_Q _preview {1} ;; esac" \
+      --preview "case {1} in $BACK|__loading|__ev*|*'|') echo 'Pick an agent to see its screen.' ;; *) $SELF_Q _preview {1} ;; esac" \
       --preview-window='right,50%,follow,hidden,border-left,<60(down,50%,follow,hidden,border-top)') || return 0
-    [[ "$sel" == __loading ]] && continue
+    [[ "$sel" == __loading || "$sel" == __ev* ]] && continue
     if [[ "$sel" == *"|" ]]; then task_actions "${sel%|}"; else agent_actions "${sel%%|*}" "${sel#*|}" || true; fi
   done
 }
@@ -2632,9 +2732,9 @@ git_counts() { # <worktree>: "<changed files> <commits not on the default branch
   echo "${n:-0} ${c:-0} ${br:--}"
 }
 dashboard() { # [full|monitor]: the overview above the main menu; monitor keeps only the task numbers
-  local mode="${1:-full}" gone t r st line f a b br prs merged gitdir u tk k m e tusd ttok tunk models rate allusd=0 alltok=0 open="" closed="" w=8 dps n_work=0 n_need=0 n_idle=0 n_stop=0 ch n base d dc dmine=0 dall parts lines="" i=0
+  local mode="${1:-full}" gone t r st line f a b br prs merged gitdir u tk k m e tusd ttok tunk models rate allusd=0 alltok=0 open="" closed="" w=8 dps n_work=0 n_need=0 n_idle=0 n_stop=0 n_done=0 ch n base d dc dmine=0 parts lines="" i=0
   pr_refresh_if_old
-  rate=$(usd_rate)
+  rate=$(usd_rate); local cols; cols=$(screen_cols)
   dps=$(docker ps --format '{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project"}}' 2>/dev/null) || dps="off"
   for t in $(all_tasks); do
     use_task "$t"
@@ -2653,8 +2753,8 @@ dashboard() { # [full|monitor]: the overview above the main menu; monitor keeps 
     use_task "$t"; line="$(printf "%-${w}s" "$t")  "
     for r in $(known_roles); do
       st=$(agent_state "$r")
-      case "$st" in working) n_work=$((n_work + 1)) ;; needs-you) n_need=$((n_need + 1)) ;; idle) n_idle=$((n_idle + 1)) ;; *) n_stop=$((n_stop + 1)) ;; esac
-      line+="$(dot "$r" word "$st")  "
+      case "$st" in working) n_work=$((n_work + 1)) ;; needs-you) n_need=$((n_need + 1)) ;; idle) n_idle=$((n_idle + 1)); [[ "$(view_state "$r" idle)" == "done" ]] && n_done=$((n_done + 1)) ;; *) n_stop=$((n_stop + 1)) ;; esac
+      if [[ $cols -ge 110 ]]; then line+="$(dot "$r" word "$st")  "; else line+="$(dot "$r" "" "$st")  "; fi   # narrow: icons only
     done
     ch=0; prs=""; tusd=0; ttok=0; tunk=0; models=""
     for r in $(task_roles); do
@@ -2669,7 +2769,7 @@ dashboard() { # [full|monitor]: the overview above the main menu; monitor keeps 
     [[ "$dps" == off ]] || dc=$(awk -F'|' -v d="$WT_ROOT/$t/" -v p="$S" 'index($1 "/", d) == 1 || $2 == p' <<< "$dps" | grep -c . || true)
     dmine=$((dmine + dc))
     line+="${C_DIM}$(plural "$ch" "changed file")${C_RESET}"
-    if [[ $ttok -gt 0 ]]; then
+    if [[ $ttok -gt 0 && $cols -ge 110 ]]; then   # a narrow screen keeps the changes, PRs and cost, not tokens and models
       line+=" · $(tokens_short "$ttok") tokens · ${C_BOLD}$(money "$tusd" "$rate")${C_RESET}$([[ $tunk -gt 0 ]] && echo "${C_DIM}+?${C_RESET}" || true)"
       line+=" · ${C_DIM}$(model_list "$models")${C_RESET}"
     fi
@@ -2680,33 +2780,25 @@ dashboard() { # [full|monitor]: the overview above the main menu; monitor keeps 
   [[ $i -gt 8 ]] && lines+="${C_DIM}… and $((i - 8)) more open tasks under 2 Running agents${C_RESET}"$'\n'
 
   local others; others=$(other_orgs_open)
-  [[ "$mode" == full ]] && printf '%s\n' "${C_BOLD}GitHub ${C_RESET}  ${C_BOLD}$ORG${C_RESET}${C_DIM} · o: switch${others:+ · also open: $others}${C_RESET}"
-  [[ "$mode" == full ]] && printf '%s\n' "${C_BOLD}Claude ${C_RESET}  $(claude_line)"
-  parts=""
-  [[ $n_need -gt 0 ]] && parts+="${C_YELLOW}${C_BOLD}$n_need $([[ $n_need -eq 1 ]] && echo needs || echo need) you${C_RESET} · "
-  [[ $n_work -gt 0 ]] && parts+="${C_GREEN}$n_work working${C_RESET} · "
-  [[ $n_idle -gt 0 ]] && parts+="$n_idle idle · "
-  [[ $n_stop -gt 0 ]] && parts+="${C_DIM}$n_stop stopped${C_RESET} · "
-  [[ "$mode" == full ]] && printf '%s\n' "${C_BOLD}Agents ${C_RESET}  ${parts:-${C_DIM}none running · }$(plural "$(count $open)" "open task")$([[ -n "$closed" ]] && echo " · $(count $closed) not open" || true)"
-  if [[ $alltok -gt 0 ]]; then
-    printf '%s\n' "${C_BOLD}Cost   ${C_RESET}  ${C_BOLD}$(money "$allusd" "$rate")${C_RESET} for $(tokens_short "$alltok") tokens on open tasks ${C_DIM}· estimate at API list prices, not your bill$([[ -n "$rate" ]] && echo " · 1 USD = $(awk -v r="$rate" 'BEGIN { printf "%.3f", r }') $CURRENCY" || true)${C_RESET}"
-  fi
-  if [[ "$mode" != full ]]; then :
-  elif [[ "$dps" == off ]]; then printf '%s\n' "${C_BOLD}Docker ${C_RESET}  ${C_DIM}not running${C_RESET}"
-  else
-    dall=$(grep -c . <<< "$dps" || true)
-    printf '%s\n' "${C_BOLD}Docker ${C_RESET}  $(plural "$dall" container) running · $dmine from these tasks"
-  fi
-  [[ "$mode" == full ]] && printf '%s\n' "${C_BOLD}Default${C_RESET}  ${C_DIM}Remote Control $REMOTE · layout $DEFAULT_LAYOUT · opens in: $DEFAULT_OPEN · $(plural "$(count $(all_roles))" agent) you can start${C_RESET}"
-  if [[ -n "$lines" ]]; then printf '\n%s' "$lines"; fi
-  if [[ "$mode" == full && -n "$closed" ]]; then
+  [[ "$mode" == full ]] || { [[ -z "$lines" ]] || printf '%s' "$lines"; return 0; }
+  printf '%s\n' "${C_BOLD}Tasks${C_RESET} ${C_DIM}· $ORG${C_RESET}"
+  if [[ -n "$lines" ]]; then printf '%s' "$lines"; else printf '%s\n' "${C_DIM}No open task · 1 starts one${C_RESET}"; fi
+  if [[ -n "$closed" ]]; then
     printf '%s\n' "${C_DIM}Not open: $(echo $closed | tr ' ' '\n' | head -n 4 | paste -sd, - | sed 's/,/, /g')$([[ $(count $closed) -gt 4 ]] && echo ", …" || true) · 3 resumes them${C_RESET}"
   fi
   gone=$(closed_unexpectedly)
-  [[ "$mode" == full && -n "$gone" ]] && printf '%s\n' "${C_YELLOW}Closed unexpectedly (Mac restart?): $(csv "$gone" | sed 's/,/, /g') · 3 resumes them all${C_RESET}"
+  [[ -z "$gone" ]] || printf '%s\n' "${C_YELLOW}Closed unexpectedly (Mac restart?): $(csv "$gone" | sed 's/,/, /g') · 3 resumes them all${C_RESET}"
   merged=$(merged_tasks)
-  [[ -n "$merged" ]] && printf '%s\n' "${C_GREEN}Merged and clean: $(csv "$merged" | sed 's/,/, /g') · 5 removes them${C_RESET}"
-  [[ "$mode" == full ]] && printf '%s\n' "${C_DIM}Updated $(date +%H:%M:%S), every 10 seconds$([[ -f "$ORG_CACHE/prs.tsv" ]] && echo " · pull requests from $(stat -f %Sm -t %H:%M "$ORG_CACHE/prs.tsv")" || true) · r: refresh now${C_RESET}"
+  [[ -z "$merged" ]] || printf '%s\n' "${C_GREEN}Merged and clean: $(csv "$merged" | sed 's/,/, /g') · 5 removes them${C_RESET}"
+  parts=""
+  [[ $n_need -gt 0 ]] && parts+="${C_YELLOW}${C_BOLD}◆ $n_need $([[ $n_need -eq 1 ]] && echo needs || echo need) you${C_RESET} · "
+  [[ $n_work -gt 0 ]] && parts+="${C_GREEN}● $n_work working${C_RESET} · "
+  [[ $n_done -gt 0 ]] && parts+="${C_GREEN}✓ $n_done done${C_RESET} · "
+  [[ $((n_idle - n_done)) -gt 0 ]] && parts+="● $((n_idle - n_done)) idle · "
+  [[ $n_stop -gt 0 ]] && parts+="${C_DIM}○ $n_stop stopped${C_RESET} · "
+  printf '\n%s\n' "${parts}${C_BOLD}$(money "$allusd" "$rate")${C_RESET}${C_DIM} for $(tokens_short "$alltok") tokens, estimate${C_RESET}"
+  printf '%s\n' "${C_DIM}GitHub $ORG$([[ -n "$others" ]] && echo " (also open: $others)" || true) · o: switch · Docker $([[ "$dps" == off ]] && echo "not running" || echo "$(plural "$(grep -c . <<< "$dps" || true)" container), $dmine from tasks") · Remote Control $REMOTE · opens in $DEFAULT_OPEN · updated $(date +%H:%M)${C_RESET}"
+  printf '%s\n' "${C_DIM}Claude $(claude_line | sed $'s/\e\\[[0-9;]*m//g')${C_RESET}"
   return 0
 }
 model_list() { # lines "agent|Model effort": one "Opus 5.5 medium" when all agree, else "be Opus 5.5 medium, ui Sonnet 5.5 high"
@@ -2741,7 +2833,7 @@ main_header() { # dashboard, then the menu title
   local dash
   if [[ "${1:-}" == cached && -n "${AA_DASH:-}" && -s "$AA_DASH" ]]; then dash=$(cat "$AA_DASH")   # instant; the live refresh follows at once
   else dash=$(dashboard); [[ -n "${AA_DASH:-}" ]] && printf '%s' "$dash" > "$AA_DASH"; fi
-  printf '%s%s\n\n%s\n%s\n' "$shown" "$dash" "${C_BOLD}What do you want to do?${C_RESET}" "${C_DIM}m: monitor · o: organisation · 1-8: jump · Enter: choose · r: refresh · q: quit${C_RESET}"
+  printf '%s%s\n\n%s\n' "$shown" "$dash" "${C_BOLD}What do you want to do?${C_RESET}"
 }
 
 interactive() { # [monitor]
@@ -2766,7 +2858,8 @@ interactive() { # [monitor]
     live 10 "bg-transform-header($SELF_Q _header)"
     choice=$(printf '%s\n' "start${TAB}1  Start new agents" "running${TAB}2  Running agents" \
       "resume${TAB}3  Resume agents" "repo${TAB}4  Add a repository" "remove${TAB}5  Remove agents" "tools${TAB}6  Skills, plugins and MCP servers" "monitor${TAB}7  Monitor: what every agent is doing" "org${TAB}8  Switch GitHub organisation" "quit${TAB}   Quit" |
-      PICK_HEADER="$(main_header cached)" NO_BACK=1 pick "" "" --no-input "${LIVE[@]}" \
+      PICK_HEADER="$(main_header cached)" PICK_FOOTER="${C_DIM}m: monitor · o: organisation · 1-8: jump · Enter: choose · r: refresh · q: quit${C_RESET}" \
+      NO_BACK=1 pick "" "" --no-input "${LIVE[@]}" \
         --bind "r:bg-transform-header($SELF_Q _header)" --bind 'esc:ignore,q:abort,j:down,k:up,1:pos(1)+accept,2:pos(2)+accept,3:pos(3)+accept,4:pos(4)+accept,5:pos(5)+accept,6:pos(6)+accept,7:pos(7)+accept,m:pos(7)+accept,8:pos(8)+accept,o:pos(8)+accept') || break
     : > "$AA_SHOWN"
     case "$choice" in
@@ -2791,7 +2884,7 @@ main() {
   resolve_org
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_listen|next|_inv|inventory|_usage|_activity|_hook|_notify) ;;
+    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_listen|next|status|_theme|_inv|inventory|_usage|_activity|_hook|_notify) ;;
     *) need_org ;;
   esac
   case "$cmd" in
@@ -2828,6 +2921,8 @@ main() {
     _notify)  notify "$@" ;;
     _hook)    hook "$@" 3>&1 >/dev/null 2>&1 </dev/stdin || true ;;   # only a decision (fd 3) reaches Claude Code
     next)     next_agent "$@" ;;
+    status)   tmux_status ;;
+    _theme)   theme ;;
     _finish_step) check_task "${1:-}"; use_task "$1"; finish_watch ;;
     _listen)  rc=0; listen "${1:?task}" "${2:?agent}" 3>&2 >/dev/null 2>&1 </dev/stdin || rc=$?; exit "$rc" ;;   # only the messages reach stderr
     _watch)   watch "${1:?task}" ;;

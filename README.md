@@ -52,6 +52,8 @@ Optional tmux keys (add to `~/.tmux.conf`):
 bind a display-popup -E -w 90% -h 90% "AA_POPUP=1 AA_OPEN=here ~/.local/bin/ai-agents"   # prefix + a: the menu
 bind O run-shell "~/.local/bin/ai-agents monitor-pane '#{pane_id}'"                       # prefix + O: monitor on the side
 bind J run-shell "~/.local/bin/ai-agents next '#{pane_id}'"                               # prefix + J: the agent waiting for you
+set -g status-right "#(~/.local/bin/ai-agents status) %H:%M"                                # status bar: ◆ 1 needs you · ● 2 working · ✓ 1 done
+set -g status-interval 5
 ```
 
 ## Daily use
@@ -63,7 +65,9 @@ bind J run-shell "~/.local/bin/ai-agents next '#{pane_id}'"                     
 5. **Next morning:** `3 Resume agents` continues the conversations where they stopped.
 6. **Done:** in the Monitor, Enter on the task, then "Finish". Every agent commits, pushes and opens its pull request, the pull requests get linked to each other, and the task removes itself once all are merged (branches stay). `5 Remove agents` removes a task right away.
 
-Keys in every screen: Enter chooses, Esc or `← Back` goes back, type to search. On the overview: `1`-`8` jump, `m` monitor, `o` switch organisation, `r` refresh, `q` quit.
+States: ◆ needs you · ● working · ✓ done (finished its turn in the last hour, your turn) · ● idle, with its age · ○ stopped · ✗ crashed · ⧗ waits for another agent · ⚠ overlaps another task. The Monitor also lists the most recent events: messages, handoffs, restarts.
+
+Keys in every screen: Enter chooses, Esc or `← Back` goes back, type to search. Each screen shows its keys at the bottom. On the overview: `1`-`8` jump, `m` monitor, `o` switch organisation, `r` refresh, `q` quit.
 
 ## How agents work together
 
@@ -99,7 +103,7 @@ ai-agents help                                 # everything else
 
 Per organisation in `~/.config/ai-agents/orgs/<owner>/`: `repos` (the agents) and an optional `settings` file with tab-separated `worktrees <folder>`, `prefix <tmux prefix>` and `issues <owner/repo>`.
 
-Environment variables you may want: `AA_OPEN` (window, tab, here, detached), `AA_LAYOUT` (own, split), `AA_REMOTE` (Remote Control on or off), `AA_NOTIFY`, `AA_AUTO_RESTART`, `AA_CLONE_ROOT` (default `~/code`), `AA_CURRENCY` (or write it to `~/.config/ai-agents/currency`, default USD).
+Environment variables you may want: `AA_OPEN` (window, tab, here, detached), `AA_LAYOUT` (own, split), `AA_REMOTE` (Remote Control on or off), `AA_NOTIFY`, `AA_AUTO_RESTART`, `AA_CLONE_ROOT` (default `~/code`), `AA_CURRENCY` (or write it to `~/.config/ai-agents/currency`, default USD), `AA_THEME` (light or dark; by default taken from the terminal), `AA_DONE_SEC` (how long a finished agent shows as done, default 3600).
 
 Costs are estimates at Anthropic's API list prices, not your bill.
 
