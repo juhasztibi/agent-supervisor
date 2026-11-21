@@ -1131,7 +1131,7 @@ add_repo() { # <path> <agent> [description]
 
 compose_projects_in() { # <folder>: compose projects whose containers were started from inside it
   docker ps -a --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null |
-    awk -F'|' -v d="$1/" '$1 != "" && index($2 "/", d) == 1 { print $1 }' | sort -u
+    awk -F'|' -v d="$1/" '$1 != "" && index($2 "/", d) == 1 { print $1 }' | sort -u || true   # Docker not running: none
 }
 clean_project() { # <compose project>
   local p="$1" f="label=com.docker.compose.project=$1"
@@ -1142,6 +1142,7 @@ clean_project() { # <compose project>
 }
 docker_clean() { # <compose project> [folder]: that project, plus every project started from inside the folder
   command -v docker >/dev/null || return 0
+  docker ps -q >/dev/null 2>&1 || { echo "docker isn't running; nothing to clean up"; return 0; }
   local p list="$1"
   [[ -n "${2:-}" ]] && list+=" $(compose_projects_in "$2" | tr '\n' ' ')"
   for p in $list; do clean_project "$p"; done
