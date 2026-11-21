@@ -1700,19 +1700,19 @@ git_counts_cached() { # <worktree>: git_counts, reused for 15 seconds (the Monit
 MON_RATE=""
 monitor_lines() { # [raw]: one row per open task with its numbers, its agents indented below it; tasks that need you first
   # raw gives "state<TAB>agent<TAB>age<TAB>usd" per agent, for the header
-  local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop n_wait wt_on ov ch prs tusd ttok models a b br
+  local s t r st kind text ts age rank trank rows="" raw="" u tk k m e info head n_need n_work n_idle n_stop n_wait n_dn wt_on ov ch prs tusd ttok models a b br
   [[ "${1:-}" == raw ]] || MON_RATE=$(usd_rate)
   local cols vst plain col pre; cols=$(screen_cols)
   for s in $(open_sessions); do
     use_task "${s#"$PREFIX-"}"
-    trank=9; n_need=0; n_work=0; n_idle=0; n_stop=0; n_wait=0; ch=0; prs=""; tusd=0; ttok=0; models=""
+    trank=9; n_need=0; n_work=0; n_idle=0; n_stop=0; n_wait=0; n_dn=0; ch=0; prs=""; tusd=0; ttok=0; models=""
     for r in $(known_roles); do
       st=$(agent_state "$r"); kind=""; text=""; ts=""; age=""
       [[ "$st" == stopped ]] || IFS=$'\t' read -r kind text ts <<< "$(activity_of "$(wt_dir "$r")")"
       [[ -n "$ts" ]] && age=$(age_of "$ts")
       u=0; tk=0; k=0; m=-; e=-
       [[ -d "$(wt_dir "$r")" ]] && read -r u tk k m e <<< "$(agent_usage "$(wt_dir "$r")")"
-      raw+="$st$TAB$(agent_name "$r")$TAB$age$TAB$u"$'\n'
+      raw+="$st$TAB$r on $TASK$TAB$age$TAB$u"$'\n'
       [[ "${1:-}" == raw ]] && continue
       case "$st" in
         needs-you) rank=1; n_need=$((n_need + 1)); read_state "$r"
@@ -1720,7 +1720,8 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
                    elif [[ "$kind" == tool ]]; then text="wants to run: $text"; fi
                    text="${C_YELLOW}$text${C_RESET}" ;;
         working)   rank=2; n_work=$((n_work + 1)) ;;
-        idle)      rank=3; n_idle=$((n_idle + 1)); [[ "$kind" == said ]] && text="said: $text" ;;
+        idle)      rank=3; n_idle=$((n_idle + 1)); [[ "$kind" == said ]] && text="said: $text"
+                   [[ "$(view_state "$r" idle)" == "done" ]] && n_dn=$((n_dn + 1)) ;;
         crashed)   rank=1; n_stop=$((n_stop + 1)); text="${C_RED}stopped unexpectedly; start it from its actions${C_RESET}"; age="" ;;
         *)         rank=4; n_stop=$((n_stop + 1)); text=""; age="" ;;
       esac
@@ -1753,7 +1754,8 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
     head="${C_BOLD}$TASK${C_RESET}  "
     [[ $n_need -gt 0 ]] && head+="${C_YELLOW}${C_BOLD}◆ $n_need $([[ $n_need -eq 1 ]] && echo needs || echo need) you${C_RESET}  "
     [[ $n_work -gt 0 ]] && head+="${C_GREEN}● $n_work working${C_RESET}  "
-    [[ $n_idle -gt 0 ]] && head+="${C_CYAN}●${C_RESET} $n_idle idle  "
+    [[ $n_dn -gt 0 ]] && head+="${C_GREEN}✓ $n_dn done${C_RESET}  "
+    [[ $((n_idle - n_dn)) -gt 0 ]] && head+="● $((n_idle - n_dn)) idle  "
     [[ $n_wait -gt 0 ]] && head+="${C_YELLOW}⧗ $n_wait waiting for an agent${C_RESET}  "
     ov=$(overlap_tasks); [[ -z "$ov" ]] || head+="${C_YELLOW}⚠ overlap with $ov${C_RESET}  "
     ov=$(queued_count); [[ "${ov:-0}" -eq 0 ]] || head+="${C_DIM}✉ $ov not delivered yet${C_RESET}  "
@@ -2269,7 +2271,7 @@ new_repo_lines() { # repositories of $ORG without an agent yet, as "+name<TAB>la
   have=" $(set_up_names | tr '\n' ' ') "
   org_repos | while IFS=$'\t' read -r n d; do
     [[ -n "$n" && "$have" != *" $(lower "$n") "* ]] || continue
-    printf '+%s\t%s\n' "$n" "${C_DIM}○${C_RESET} $(printf '%-24s' "$n")${C_DIM}${d:+$d · }new: sets it up as an agent${C_RESET}"
+    printf '+%s\t%s %-30s %s\n' "$n" "${C_DIM}$(printf '%-6s' new)${C_RESET}" "$n" "${C_DIM}${d:+$d · }sets it up as an agent${C_RESET}"   # columns as agent_line
   done
 }
 set_up_new() { # <picked values>: sets up every "+repo" (cloned when needed) and prints all as agents; fails after showing why
