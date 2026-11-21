@@ -420,6 +420,9 @@ out=$(AA_COLOR= "$A" _header); first=$(grep -n 't13' <<< "$out" | head -1 | cut 
 [[ -n "$first" && -n "$claude" && $first -lt $claude ]] && ok "the overview shows tasks before the setup lines" || bad "the overview shows tasks before the setup lines" "$out"
 eq "a light terminal gets the light theme" "light" "$(COLORFGBG='0;15' "$A" _theme)"
 eq "a dark terminal the dark one" "dark" "$(COLORFGBG='15;0' "$A" _theme)"
+printf 'idle\ta[$(touch %s)]\tfinished its turn\n' "$T/pwned" > "$W/t13/ui.state"
+AA_COLOR= "$A" _monitor >/dev/null 2>&1; "$A" status >/dev/null 2>&1; "$A" next --print >/dev/null 2>&1
+check "a crafted state file never runs a command" test ! -e "$T/pwned"
 "$A" down t13 --prune >/dev/null 2>&1
 
 section "Overlap between tasks"

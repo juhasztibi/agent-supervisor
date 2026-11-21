@@ -329,6 +329,7 @@ set_state() { # <agent> <state> <detail> [since]
 read_state() { # <agent>: sets ST, ST_T, ST_D (empty when no hook has reported yet)
   ST=""; ST_T=0; ST_D=""
   [[ -f "$(state_file "$1")" ]] && IFS=$'\t' read -r ST ST_T ST_D < "$(state_file "$1")" || true
+  [[ "$ST_T" =~ ^[0-9]+$ ]] || ST_T=0   # agents can write this file: never let bash evaluate it as arithmetic
 }
 hook() { # <task> <agent> <event>: Claude Code calls this; it never fails, and prints only a decision, on fd 3
   local event="$3" input tool="" what="" msg="" kind="" mail
@@ -418,7 +419,8 @@ watch_agent() { # <agent>: restart a crashed agent, alert when it looks stuck or
     case "$ST" in
       starting) [[ $((now - ST_T)) -gt 120 ]] && { set_state "$r" crashed "did not start"; watch_log "$r did not start"; notify_text "$title did not start" "" "Start it again from the menu."; } ;;
       idle|working|needs-you)   # it was alive and ended without saying so: a crash
-        [[ $((now - $(cat "$WT_ROOT/$TASK/$r.stopping" 2>/dev/null || echo 0))) -lt 60 ]] && return 0   # being stopped right now
+        f=$(cat "$WT_ROOT/$TASK/$r.stopping" 2>/dev/null || true); [[ "$f" =~ ^[0-9]+$ ]] || f=0   # digits only, as above
+        [[ $((now - f)) -lt 60 ]] && return 0   # being stopped right now
         f="$WT_ROOT/$TASK/$r.restarts"
         recent=$(awk -v n="$now" '$1 > n - 3600' "$f" 2>/dev/null | grep -c . || true)
         if [[ "$AUTO_RESTART" == on && "$recent" -lt 3 ]]; then
@@ -797,6 +799,7 @@ mail_watch() { # the watchdog: tells you what can't be delivered, what stays una
   now=$(date +%s)
   while IFS=$'\t' read -r id t from to kind ref sha br st d _ al text; do
     [[ -n "$id" ]] || continue
+    [[ "$t" =~ ^[0-9]+$ ]] || t=$now; [[ "$d" =~ ^[0-9]+$ ]] || d=$now   # agents can write this file: digits only
     if [[ "$st" == queued && $((now - t)) -ge $DELIVER_SEC ]]; then
       if is_running "$to"; then
         if [[ "$al" != undelivered && "$(agent_state "$to")" != needs-you ]]; then
@@ -1726,7 +1729,7 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
       elif [[ "$st" == idle ]]; then wt_on=$(open_question "$r"); [[ -z "$wt_on" ]] || text="${C_YELLOW}? question from ${wt_on%%$TAB*}: ${wt_on#*$TAB}${C_RESET}"; fi
       [[ $rank -lt $trank ]] && trank=$rank
       vst=$(view_state "$r" "$st")   # the state word carries its age; agents without state hooks keep their activity's age
-      [[ ( "$vst" == done || "$vst" == idle ) && -n "$(state_age "$r")" ]] && age=""
+      [[ ( "$vst" == "done" || "$vst" == idle ) && -n "$(state_age "$r")" ]] && age=""
       info=""
       if [[ "${tk:-0}" -gt 0 ]]; then
         info="$(model_short "$m")$([[ "$e" != - ]] && echo " $e" || true) · $(money "$u" "$MON_RATE")"
@@ -2037,7 +2040,7 @@ view_state() { # <agent> [state]: the state as you see it: an idle agent is "don
   [[ -n "$st" ]] || st=$(agent_state "$1")
   if [[ "$st" == idle ]]; then
     read_state "$1"
-    [[ "$ST" == idle && "$ST_D" == "finished its turn" && $(( $(date +%s) - ST_T )) -lt $DONE_SEC ]] && st=done
+    [[ "$ST" == idle && "$ST_D" == "finished its turn" && $(( $(date +%s) - ST_T )) -lt $DONE_SEC ]] && st="done"
   fi
   echo "$st"
 }
@@ -2454,7 +2457,7 @@ agent_inventory() { # <task> <agent>: what this agent used, then what only its r
   done
 }
 
-monitor_done_count() { local s r n=0; for s in $(open_sessions); do use_task "${s#"$PREFIX-"}"; for r in $(known_roles); do [[ "$(view_state "$r")" == done ]] && n=$((n + 1)); done; done; echo "$n"; }
+monitor_done_count() { local s r n=0; for s in $(open_sessions); do use_task "${s#"$PREFIX-"}"; for r in $(known_roles); do [[ "$(view_state "$r")" == "done" ]] && n=$((n + 1)); done; done; echo "$n"; }
 monitor_header() { # the top of the Monitor: who waits for you and since when, totals, merged tasks
   local rows need="" n_need=0 n_work=0 n_idle=0 n_stop=0 n_done=0 st who age u usd=0 rate merged
   rows=$(monitor_lines raw); rate=$(usd_rate)
@@ -2729,7 +2732,7 @@ git_counts() { # <worktree>: "<changed files> <commits not on the default branch
   echo "${n:-0} ${c:-0} ${br:--}"
 }
 dashboard() { # [full|monitor]: the overview above the main menu; monitor keeps only the task numbers
-  local mode="${1:-full}" gone t r st line f a b br prs merged gitdir u tk k m e tusd ttok tunk models rate allusd=0 alltok=0 open="" closed="" w=8 dps n_work=0 n_need=0 n_idle=0 n_stop=0 n_done=0 ch n base d dc dmine=0 dall parts lines="" i=0
+  local mode="${1:-full}" gone t r st line f a b br prs merged gitdir u tk k m e tusd ttok tunk models rate allusd=0 alltok=0 open="" closed="" w=8 dps n_work=0 n_need=0 n_idle=0 n_stop=0 n_done=0 ch n base d dc dmine=0 parts lines="" i=0
   pr_refresh_if_old
   rate=$(usd_rate); local cols; cols=$(screen_cols)
   dps=$(docker ps --format '{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project"}}' 2>/dev/null) || dps="off"
@@ -2750,7 +2753,7 @@ dashboard() { # [full|monitor]: the overview above the main menu; monitor keeps 
     use_task "$t"; line="$(printf "%-${w}s" "$t")  "
     for r in $(known_roles); do
       st=$(agent_state "$r")
-      case "$st" in working) n_work=$((n_work + 1)) ;; needs-you) n_need=$((n_need + 1)) ;; idle) n_idle=$((n_idle + 1)); [[ "$(view_state "$r" idle)" == done ]] && n_done=$((n_done + 1)) ;; *) n_stop=$((n_stop + 1)) ;; esac
+      case "$st" in working) n_work=$((n_work + 1)) ;; needs-you) n_need=$((n_need + 1)) ;; idle) n_idle=$((n_idle + 1)); [[ "$(view_state "$r" idle)" == "done" ]] && n_done=$((n_done + 1)) ;; *) n_stop=$((n_stop + 1)) ;; esac
       if [[ $cols -ge 110 ]]; then line+="$(dot "$r" word "$st")  "; else line+="$(dot "$r" "" "$st")  "; fi   # narrow: icons only
     done
     ch=0; prs=""; tusd=0; ttok=0; tunk=0; models=""
