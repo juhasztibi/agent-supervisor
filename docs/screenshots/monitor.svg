@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="976" height="678" viewBox="0 0 976 678">
+<rect width="976" height="678" rx="10" fill="#1e1e2e"/>
+<circle cx="20" cy="17" r="6" fill="#f38ba8"/><circle cx="40" cy="17" r="6" fill="#f9e2af"/><circle cx="60" cy="17" r="6" fill="#a6e3a1"/>
+<text x="488.0" y="22" fill="#7f849c" font-family="Menlo, Consolas, monospace" font-size="12" text-anchor="middle">ai-agents: Monitor</text>
+<g font-family="Menlo, 'SF Mono', Consolas, 'DejaVu Sans Mono', monospace" font-size="14">
+<text x="18.0" y="65" fill="#808080" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">╭─</text>
+<text x="43.2" y="65" fill="#87afd7" font-weight="bold" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ai-agents</text>
+<text x="127.2" y="65" fill="#808080" textLength="831.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────────────────────────────────────────────────────────────────────────────────╮</text>
+<text x="18.0" y="84" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="84" fill="#bcbcbc" font-weight="bold" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Now</text>
+<text x="135.6" y="84" fill="#f9e2af" font-weight="bold" textLength="403.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">waiting for you: web on checkout-redesign for 1m</text>
+<text x="950.4" y="84" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="103" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="103" fill="#bcbcbc" font-weight="bold" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Agents</text>
+<text x="135.6" y="103" fill="#a6e3a1" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1 working</text>
+<text x="219.6" y="103" fill="#bcbcbc" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="236.4" y="103" fill="#a6e3a1" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓ 1 done</text>
+<text x="312.0" y="103" fill="#bcbcbc" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">· 0 idle ·</text>
+<text x="404.4" y="103" fill="#bcbcbc" opacity="0.55" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">0 stopped</text>
+<text x="488.4" y="103" fill="#bcbcbc" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="505.2" y="103" fill="#bcbcbc" font-weight="bold" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">USD 3.16</text>
+<text x="580.8" y="103" fill="#bcbcbc" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">so far</text>
+<text x="639.6" y="103" fill="#bcbcbc" opacity="0.55" textLength="302.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">(estimate at API list prices, not y…</text>
+<text x="950.4" y="103" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="122" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="122" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="141" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="141" fill="#bcbcbc" font-weight="bold" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Monitor</text>
+<text x="127.2" y="141" fill="#bcbcbc" opacity="0.55" textLength="462.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">· by task, those that need you first · updated 13:48:33</text>
+<text x="950.4" y="141" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="160" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="34.8" y="160" fill="#87afd7" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">&gt;</text>
+<text x="950.4" y="160" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="179" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="34.8" y="162" width="8.4" height="19" fill="#303030"/>
+<text x="34.8" y="179" fill="#87afd7" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▶</text>
+<rect x="43.2" y="162" width="16.8" height="19" fill="#303030"/>
+<rect x="60.0" y="162" width="50.4" height="19" fill="#303030"/>
+<text x="60.0" y="179" fill="#f9e2af" font-weight="bold" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">← Back</text>
+<text x="950.4" y="179" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="198" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="198" fill="#cdd6f4" font-weight="bold" textLength="142.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">checkout-redesign</text>
+<text x="219.6" y="198" fill="#f9e2af" font-weight="bold" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">◆ 1 needs you</text>
+<text x="345.6" y="198" fill="#a6e3a1" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">● 1 working</text>
+<text x="454.8" y="198" fill="#cdd6f4" opacity="0.55" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="471.6" y="198" fill="#cdd6f4" textLength="252.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1 changed file · 2.3M tokens ·</text>
+<text x="732.0" y="198" fill="#cdd6f4" font-weight="bold" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">USD 2.46</text>
+<text x="807.6" y="198" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="824.4" y="198" fill="#cdd6f4" opacity="0.55" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Opus 5.5</text>
+<text x="900.0" y="198" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="916.8" y="198" fill="#cdd6f4" opacity="0.55" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ap…</text>
+<text x="950.4" y="198" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="217" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="110.4" y="217" fill="#f9e2af" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">◆</text>
+<text x="127.2" y="217" fill="#cdd6f4" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">web</text>
+<text x="177.6" y="217" fill="#f9e2af" font-weight="bold" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">needs you</text>
+<text x="261.6" y="217" fill="#cdd6f4" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">3m</text>
+<text x="303.6" y="217" fill="#f9e2af" textLength="319.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">wants to run: Bash: pnpm test checkout</text>
+<text x="950.4" y="217" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="236" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="110.4" y="236" fill="#a6e3a1" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
+<text x="127.2" y="236" fill="#cdd6f4" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">api</text>
+<text x="177.6" y="236" fill="#a6e3a1" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">working</text>
+<text x="261.6" y="236" fill="#cdd6f4" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1m</text>
+<text x="303.6" y="236" fill="#cdd6f4" textLength="226.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Edit: src/orders/summary.ts</text>
+<text x="950.4" y="236" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="255" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="255" fill="#cdd6f4" font-weight="bold" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">login-timeout</text>
+<text x="186.0" y="255" fill="#a6e3a1" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓ 1 done</text>
+<text x="270.0" y="255" fill="#cdd6f4" opacity="0.55" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="286.8" y="255" fill="#cdd6f4" textLength="260.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">0 changed files · 641k tokens ·</text>
+<text x="555.6" y="255" fill="#cdd6f4" font-weight="bold" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">USD 0.69</text>
+<text x="631.2" y="255" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="648.0" y="255" fill="#cdd6f4" opacity="0.55" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Opus 5.5</text>
+<text x="723.6" y="255" fill="#cdd6f4" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">· api #42</text>
+<text x="807.6" y="255" fill="#a6e3a1" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓ checks pass</text>
+<text x="950.4" y="255" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="274" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="110.4" y="274" fill="#a6e3a1" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓</text>
+<text x="127.2" y="274" fill="#cdd6f4" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">api</text>
+<text x="177.6" y="274" fill="#a6e3a1" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">done 5m</text>
+<text x="303.6" y="274" fill="#cdd6f4" opacity="0.55" textLength="630.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">said: Fixed the timeout: sessions now refresh 5 minutes before they expire…</text>
+<text x="950.4" y="274" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="293" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="293" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="312" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="312" fill="#cdd6f4" font-weight="bold" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Recent events</text>
+<text x="950.4" y="312" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="331" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="331" fill="#cdd6f4" opacity="0.55" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">13:48</text>
+<text x="118.8" y="331" fill="#cdd6f4" opacity="0.55" textLength="789.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">checkout-redesign api → web handoff: GET /orders/:id/summary returns {items, totals, currency}</text>
+<text x="950.4" y="331" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="350" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="350" fill="#cdd6f4" opacity="0.55" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">13:48</text>
+<text x="118.8" y="350" fill="#cdd6f4" opacity="0.55" textLength="445.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">checkout-redesign web asked api: Are totals in cents?</text>
+<text x="950.4" y="350" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="369" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="369" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="388" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="388" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="407" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="407" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="426" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="426" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="445" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="445" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="464" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="464" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="483" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="483" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="502" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="502" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="521" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="521" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="540" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="540" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="559" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="559" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="578" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="578" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="597" fill="#cdd6f4" textLength="940.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ ─────────────────────────────────────────────────────────────────────────────────────────────────────────────│</text>
+<text x="18.0" y="616" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="616" fill="#808080" opacity="0.55" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">◆ needs you</text>
+<text x="169.2" y="616" fill="#808080" opacity="0.55" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">● working</text>
+<text x="261.6" y="616" fill="#808080" opacity="0.55" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓ done</text>
+<text x="328.8" y="616" fill="#808080" opacity="0.55" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">● idle</text>
+<text x="396.0" y="616" fill="#808080" opacity="0.55" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">○ stopped</text>
+<text x="488.4" y="616" fill="#808080" opacity="0.55" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✗ crashed</text>
+<text x="580.8" y="616" fill="#808080" opacity="0.55" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">⧗ waits for an agent</text>
+<text x="765.6" y="616" fill="#808080" opacity="0.55" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">⚠ overlap</text>
+<text x="950.4" y="616" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="635" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="635" fill="#808080" opacity="0.55" textLength="831.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Enter: actions · ?: live view · type to search · age: since the last step · Esc or ← Back: overview</text>
+<text x="950.4" y="635" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="654" fill="#cdd6f4" textLength="940.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+</g></svg>

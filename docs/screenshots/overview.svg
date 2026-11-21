@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="976" height="488" viewBox="0 0 976 488">
+<rect width="976" height="488" rx="10" fill="#1e1e2e"/>
+<circle cx="20" cy="17" r="6" fill="#f38ba8"/><circle cx="40" cy="17" r="6" fill="#f9e2af"/><circle cx="60" cy="17" r="6" fill="#a6e3a1"/>
+<text x="488.0" y="22" fill="#7f849c" font-family="Menlo, Consolas, monospace" font-size="12" text-anchor="middle">ai-agents: overview</text>
+<g font-family="Menlo, 'SF Mono', Consolas, 'DejaVu Sans Mono', monospace" font-size="14">
+<text x="18.0" y="65" fill="#808080" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">╭─</text>
+<text x="43.2" y="65" fill="#87afd7" font-weight="bold" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ai-agents</text>
+<text x="127.2" y="65" fill="#808080" textLength="831.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────────────────────────────────────────────────────────────────────────────────╮</text>
+<text x="18.0" y="84" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="84" fill="#bcbcbc" font-weight="bold" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tasks</text>
+<text x="110.4" y="84" fill="#bcbcbc" opacity="0.55" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">· acme</text>
+<text x="950.4" y="84" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="103" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="103" fill="#bcbcbc" textLength="142.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">checkout-redesign</text>
+<text x="219.6" y="103" fill="#a6e3a1" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
+<text x="236.4" y="103" fill="#bcbcbc" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">api</text>
+<text x="295.2" y="103" fill="#f9e2af" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">◆</text>
+<text x="312.0" y="103" fill="#bcbcbc" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">web</text>
+<text x="370.8" y="103" fill="#bcbcbc" opacity="0.55" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1 changed file</text>
+<text x="496.8" y="103" fill="#bcbcbc" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="513.6" y="103" fill="#bcbcbc" opacity="0.55" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">api: 1 commit, no PR</text>
+<text x="950.4" y="103" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="122" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="122" fill="#bcbcbc" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">login-timeout</text>
+<text x="219.6" y="122" fill="#a6e3a1" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓</text>
+<text x="236.4" y="122" fill="#bcbcbc" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">api</text>
+<text x="295.2" y="122" fill="#bcbcbc" opacity="0.55" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">0 changed files</text>
+<text x="429.6" y="122" fill="#bcbcbc" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">· api #42</text>
+<text x="513.6" y="122" fill="#a6e3a1" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓ checks pass</text>
+<text x="950.4" y="122" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="141" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="141" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="160" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="160" fill="#f9e2af" font-weight="bold" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">◆ 1 needs you</text>
+<text x="177.6" y="160" fill="#bcbcbc" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="194.4" y="160" fill="#a6e3a1" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">● 1 working</text>
+<text x="295.2" y="160" fill="#bcbcbc" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="312.0" y="160" fill="#a6e3a1" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓ 1 done</text>
+<text x="387.6" y="160" fill="#bcbcbc" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">·</text>
+<text x="404.4" y="160" fill="#bcbcbc" font-weight="bold" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">USD 3.16</text>
+<text x="480.0" y="160" fill="#bcbcbc" opacity="0.55" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">for 2.9M tokens, estimate</text>
+<text x="950.4" y="160" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="179" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="179" fill="#bcbcbc" opacity="0.55" textLength="882.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">GitHub acme · o: switch · Docker 0 containers, 0 from tasks · Remote Control on · opens in window · upda…</text>
+<text x="950.4" y="179" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="198" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="198" fill="#bcbcbc" opacity="0.55" textLength="714.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Claude dev@example.com · Acme · team plan · login valid 26 days · Claude Code 2.1.330</text>
+<text x="950.4" y="198" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="217" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="950.4" y="217" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="236" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="236" fill="#bcbcbc" font-weight="bold" textLength="193.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">What do you want to do?</text>
+<text x="950.4" y="236" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="255" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="34.8" y="238" width="8.4" height="19" fill="#303030"/>
+<text x="34.8" y="255" fill="#87afd7" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▶</text>
+<rect x="43.2" y="238" width="16.8" height="19" fill="#303030"/>
+<rect x="60.0" y="238" width="159.6" height="19" fill="#303030"/>
+<text x="60.0" y="255" fill="#e4e4e4" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1</text>
+<text x="85.2" y="255" fill="#e4e4e4" font-weight="bold" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Start new agents</text>
+<text x="950.4" y="255" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="274" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="274" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">2</text>
+<text x="85.2" y="274" fill="#cdd6f4" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Running agents</text>
+<text x="950.4" y="274" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="293" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="293" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">3</text>
+<text x="85.2" y="293" fill="#cdd6f4" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Resume agents</text>
+<text x="950.4" y="293" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="312" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="312" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">4</text>
+<text x="85.2" y="312" fill="#cdd6f4" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Add a repository</text>
+<text x="950.4" y="312" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="331" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="331" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">5</text>
+<text x="85.2" y="331" fill="#cdd6f4" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Remove agents</text>
+<text x="950.4" y="331" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="350" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="350" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">6</text>
+<text x="85.2" y="350" fill="#cdd6f4" textLength="260.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Skills, plugins and MCP servers</text>
+<text x="950.4" y="350" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="369" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="369" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">7</text>
+<text x="85.2" y="369" fill="#cdd6f4" textLength="285.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Monitor: what every agent is doing</text>
+<text x="950.4" y="369" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="388" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="388" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">8</text>
+<text x="85.2" y="388" fill="#cdd6f4" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Switch GitHub organisation</text>
+<text x="950.4" y="388" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="407" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="85.2" y="407" fill="#cdd6f4" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Quit</text>
+<text x="950.4" y="407" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="426" fill="#cdd6f4" textLength="940.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ ─────────────────────────────────────────────────────────────────────────────────────────────────────────────│</text>
+<text x="18.0" y="445" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="445" fill="#808080" opacity="0.55" textLength="663.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">m: monitor · o: organisation · 1-8: jump · Enter: choose · r: refresh · q: quit</text>
+<text x="950.4" y="445" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="464" fill="#cdd6f4" textLength="940.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+</g></svg>

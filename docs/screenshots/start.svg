@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="976" height="298" viewBox="0 0 976 298">
+<rect width="976" height="298" rx="10" fill="#1e1e2e"/>
+<circle cx="20" cy="17" r="6" fill="#f38ba8"/><circle cx="40" cy="17" r="6" fill="#f9e2af"/><circle cx="60" cy="17" r="6" fill="#a6e3a1"/>
+<text x="488.0" y="22" fill="#7f849c" font-family="Menlo, Consolas, monospace" font-size="12" text-anchor="middle">ai-agents: start agents</text>
+<g font-family="Menlo, 'SF Mono', Consolas, 'DejaVu Sans Mono', monospace" font-size="14">
+<text x="18.0" y="65" fill="#808080" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">╭─</text>
+<text x="43.2" y="65" fill="#87afd7" font-weight="bold" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ai-agents</text>
+<text x="127.2" y="65" fill="#808080" textLength="831.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">──────────────────────────────────────────────────────────────────────────────────────────────────╮</text>
+<text x="18.0" y="84" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="84" fill="#bcbcbc" font-weight="bold" textLength="436.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Which repositories should get an agent on dark-mode?</text>
+<text x="950.4" y="84" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="103" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="34.8" y="103" fill="#87afd7" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">&gt;</text>
+<text x="950.4" y="103" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="122" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="43.2" y="122" fill="#87d787" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓</text>
+<text x="60.0" y="122" fill="#cdd6f4" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">api</text>
+<text x="118.8" y="122" fill="#cdd6f4" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">api</text>
+<text x="379.2" y="122" fill="#cdd6f4" opacity="0.55" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Backend API</text>
+<text x="950.4" y="122" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="141" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<rect x="34.8" y="124" width="8.4" height="19" fill="#303030"/>
+<text x="34.8" y="141" fill="#87afd7" font-weight="bold" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▶</text>
+<rect x="43.2" y="124" width="16.8" height="19" fill="#303030"/>
+<text x="43.2" y="141" fill="#87d787" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">✓</text>
+<rect x="60.0" y="124" width="319.2" height="19" fill="#303030"/>
+<text x="60.0" y="141" fill="#e4e4e4" font-weight="bold" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">web</text>
+<text x="118.8" y="141" fill="#e4e4e4" font-weight="bold" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">web</text>
+<rect x="379.2" y="124" width="58.8" height="19" fill="#303030"/>
+<text x="379.2" y="141" fill="#e4e4e4" font-weight="bold" opacity="0.55" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Web app</text>
+<text x="950.4" y="141" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="160" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="160" fill="#cdd6f4" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">docs</text>
+<text x="118.8" y="160" fill="#cdd6f4" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">docs</text>
+<text x="379.2" y="160" fill="#cdd6f4" opacity="0.55" textLength="151.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Documentation site</text>
+<text x="950.4" y="160" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="179" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="179" fill="#cdd6f4" opacity="0.55" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">new</text>
+<text x="118.8" y="179" fill="#cdd6f4" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">mobile</text>
+<text x="379.2" y="179" fill="#cdd6f4" opacity="0.55" textLength="369.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">iOS and Android app · sets it up as an agent</text>
+<text x="950.4" y="179" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="198" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="198" fill="#cdd6f4" opacity="0.55" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">new</text>
+<text x="118.8" y="198" fill="#cdd6f4" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">payments</text>
+<text x="379.2" y="198" fill="#cdd6f4" opacity="0.55" textLength="336.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Payment service · sets it up as an agent</text>
+<text x="950.4" y="198" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="217" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="217" fill="#f9e2af" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">← Back</text>
+<text x="950.4" y="217" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="236" fill="#cdd6f4" textLength="940.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ ─────────────────────────────────────────────────────────────────────────────────────────────────────────────│</text>
+<text x="18.0" y="255" fill="#cdd6f4" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="60.0" y="255" fill="#808080" opacity="0.55" textLength="882.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Only ticked ones start and get a worktree. Nothing ticked: the highlighted one starts · Type to search ·…</text>
+<text x="950.4" y="255" fill="#808080" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="18.0" y="274" fill="#cdd6f4" textLength="940.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+</g></svg>
