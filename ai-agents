@@ -47,6 +47,9 @@
 #   remove <task> a[,b] [--force]                                                stop agents and delete their panes and worktrees
 #                                                                                (all agents: the whole task; --force drops uncommitted changes)
 #   resume-all [open]                                                            resume every task that closed unexpectedly (crash, Mac restart)
+#   finish <task>                                                                every agent pushes and opens its pull request; the PRs get
+#                                                                                linked, and the task is removed once all are merged
+#   next   [pane]                                                                go to the agent that has waited longest for you (prefix + J)
 #   down   <task> [--prune]                                                      stop everything and clean docker
 #                                                                                (--prune also removes clean worktrees)
 #   menu                                                                         the interactive menu
@@ -381,8 +384,8 @@ on run argv
 end run
 EOF
 }
-LOCKED=""
-lock_at() { # <lock dir> [tries of 0.1 s]: waits for the lock; fails when it stays busy
+LOCKED="" GOT=""
+lock_at() { # <lock dir> [tries of 0.1 s]: waits for the lock and sets GOT; fails when it stays busy
   local d="$1" i=0 max="${2:-600}"
   mkdir -p "${d%/*}"
   until mkdir "$d" 2>/dev/null; do
@@ -390,10 +393,12 @@ lock_at() { # <lock dir> [tries of 0.1 s]: waits for the lock; fails when it sta
     i=$((i + 1)); [[ $i -lt $max ]] || return 1
     sleep 0.1
   done
-  LOCKED="$d"
+  GOT="$d"
 }
-lock_task() { lock_at "$WT_ROOT/.$TASK.lock" "${1:-600}"; }   # [tries]: one command at a time changes a task (agents run start themselves)
+lock_task() { lock_at "$WT_ROOT/.$TASK.lock" "${1:-600}" && LOCKED="$GOT"; }   # [tries]   # [tries]: one command at a time changes a task (agents run start themselves)
 unlock_task() { [[ -z "$LOCKED" ]] || rmdir "$LOCKED" 2>/dev/null; LOCKED=""; return 0; }
+MAIL_LOCKED=""   # its own variable: messages are queued while a command holds the task lock
+mail_unlock() { [[ -z "$MAIL_LOCKED" ]] || rmdir "$MAIL_LOCKED" 2>/dev/null; MAIL_LOCKED=""; return 0; }
 watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$WT_ROOT/$TASK/watchdog.log"; }
 watch_start() { # starts the task's watchdog unless it already runs
   local pidf="$WT_ROOT/$TASK/.watch.pid" pid
@@ -452,9 +457,96 @@ watch() { # <task>: the loop; it ends when the task's tmux session is gone
   while session_exists; do
     for r in $(known_roles); do watch_agent "$r" || true; done
     mail_watch || true
+    finish_watch || true
     sleep "$WATCH_SEC"
   done
   rm -f "$WT_ROOT/$TASK/.watch.pid"
+}
+
+# ---- jump to the agent that waits for you (tmux: prefix + J) ----
+waiting_agents() { # agents of every organisation that ask you something, oldest wait first: "since<TAB>pane<TAB>task<TAB>agent<TAB>what"
+  local d s r
+  for d in "$CONFIG_DIR"/orgs/*/; do
+    [[ -d "$d" ]] || continue
+    ( use_org "$(basename "$d")"
+      for s in $(open_sessions); do
+        use_task "${s#"$PREFIX-"}"
+        for r in $(known_roles); do
+          [[ "$(agent_state "$r")" == needs-you ]] || continue
+          read_state "$r"; printf '%s\t%s\t%s\t%s\t%s\n' "${ST_T:-0}" "$(agent_pane "$r")" "$TASK" "$r" "${ST_D% \[reminded\]}"
+        done
+      done )
+  done | sort -n | awk -F'\t' '$2 != "" && !seen[$2]++'
+}
+next_agent() { # [pane you are in] [--print]: the agent that has waited longest for you; from that agent, the next one
+  local cur="" print="" a list t n since pane task r what
+  for a in "$@"; do if [[ "$a" == --print ]]; then print=1; else cur="$a"; fi; done
+  list=$(waiting_agents); n=$(grep -c . <<< "$list" || true)
+  if [[ -z "$list" ]]; then
+    if [[ -n "$print" ]]; then echo "Nobody is waiting for you"; else tmux display-message "Nobody is waiting for you"; fi
+    return 0
+  fi
+  t=$(awk -F'\t' -v c="$cur" 'NR == 1 { first = $0 } hit && t == "" { t = $0 } $2 == c { hit = 1 } END { print (t != "" ? t : first) }' <<< "$list")
+  IFS=$'\t' read -r since pane task r what <<< "$t"
+  if [[ -n "$print" ]]; then printf '%s\t%s\t%s\t%s\n' "$pane" "$task" "$r" "$what"; return 0; fi
+  tmux select-window -t "$pane" \; select-pane -t "$pane" \; switch-client -t "$pane"
+  tmux display-message "$task · $r waits for you since $(age_of_epoch "$since"): ${what:-a question}$([[ $n -gt 1 ]] && echo "  ($n waiting, prefix + J for the next)" || true)"
+}
+
+# ---- finishing a task: every agent pushes and opens its pull request; the PRs get linked; a merged task removes itself ----
+finish_text() { # <agent>
+  echo "Finish this task: commit all your work, push branch $TASK, and open a pull request with gh pr create, following the repo's pull request template and rules, unless one is open already. Then tell me the link in your normal output. The other agents of this task do the same in their repos; $PROG links the pull requests to each other and removes the task once they are all merged."
+}
+finish() { # TASK: asks every agent to wrap up, starting stopped ones; the watchdog does the rest (finish_watch)
+  local r roles started=""
+  roles=$(task_roles); roles="${roles% }"
+  [[ -n "$roles" ]] || die "task $TASK has no worktrees"
+  ensure_task "" ""
+  date +%s > "$WT_ROOT/$TASK/finish"
+  for r in $roles; do
+    mail_add "$TASK" you "$r" note - - - "$(finish_text "$r")" >/dev/null   # queued first: a start delivers it at once
+    if ! is_up "$r"; then place "$r" "$LAYOUT"; launch "$r" continue; started+="$r "; fi
+  done
+  pr_refresh_if_old
+  echo "asked $(csv "$roles") to commit, push and open pull requests${started:+; started $(csv "${started% }")}."
+  echo "The pull requests get linked to each other, and $TASK is removed once all are merged (branches stay)."
+}
+finish_status() { # "<pull requests open or merged> <agents>" of a finishing task, or nothing
+  [[ -f "$WT_ROOT/$TASK/finish" ]] || return 0
+  local r n=0 total=0 pr
+  for r in $(task_roles); do
+    total=$((total + 1))
+    pr=$(pr_of "$r" "$(git -C "$(wt_dir "$r")" branch --show-current 2>/dev/null)")
+    [[ "$pr" == *" OPEN "* || "$pr" == *" MERGED "* ]] && n=$((n + 1))
+  done
+  echo "$n $total"
+}
+finish_label() { local n t; read -r n t <<< "$(finish_status)"; [[ -n "$n" ]] || return 0   # for the Monitor and the overview
+  if [[ "$n" -lt "$t" ]]; then printf '%s' "${C_CYAN}finishing: $n of $(plural "$t" "pull request")${C_RESET}"
+  else printf '%s' "${C_CYAN}waiting for review: $(plural "$t" "pull request")${C_RESET}"; fi
+}
+finish_watch() { # the watchdog of a finishing task: link the pull requests once all exist; remove the task once all are merged
+  local r pr urls="" url others n t
+  [[ -f "$WT_ROOT/$TASK/finish" ]] || return 0
+  pr_refresh_if_old
+  read -r n t <<< "$(finish_status)"
+  if [[ "$n" -eq "$t" && "$t" -ge 2 && ! -f "$WT_ROOT/$TASK/linked" ]]; then
+    for r in $(task_roles); do
+      pr=$(pr_of "$r" "$(git -C "$(wt_dir "$r")" branch --show-current 2>/dev/null)"); urls+="${pr##* } "
+    done
+    for url in $urls; do
+      others=$(printf '%s\n' $urls | grep -vxF "$url" | paste -sd' ' -)
+      gh pr comment "$url" --body "Part of task $TASK, together with: $others" >/dev/null 2>&1 || watch_log "couldn't comment on $url"
+    done
+    touch "$WT_ROOT/$TASK/linked"; watch_log "pull requests linked: $urls"
+  fi
+  if task_merged "$TASK" && [[ -z "$(find "$WT_ROOT/$TASK/removing" -mmin -10 2>/dev/null)" ]]; then   # once, retried after 10 min
+    date +%s > "$WT_ROOT/$TASK/removing"
+    watch_log "all pull requests merged; removing the task"
+    notify_text "$TASK merged" "Every pull request is merged" "Worktrees and containers removed; branches kept."
+    ( "$SELF" down "$TASK" --prune >/dev/null 2>&1 & )
+  fi
+  return 0
 }
 
 # ---- tasks that were open when the Mac restarted or tmux died ----
@@ -531,7 +623,7 @@ EOF
 # ever typed into it. The watchdog tells you about messages it can't deliver, questions left unanswered and long waits.
 clean_text() { printf '%s' "$1" | tr '[:cntrl:]' ' ' | cut -c1-500; }   # one line, no terminal control codes
 mail_file() { echo "$WT_ROOT/$1/messages.tsv"; }                        # <task>
-mail_lock() { lock_at "$WT_ROOT/.$1.mail.lock" "${2:-100}"; }            # <task> [tries]
+mail_lock() { lock_at "$WT_ROOT/.$1.mail.lock" "${2:-100}" && MAIL_LOCKED="$GOT"; }            # <task> [tries]
 me_agent() { # the agent session that runs this command: sets ME and the task (agents started by us have AA_AGENT and AA_TASK)
   [[ -n "${AA_AGENT:-}" && -n "${AA_TASK:-}" ]] || die "run this from an agent session (it reads AA_AGENT and AA_TASK, which $PROG sets for its agents)"
   check_task "$AA_TASK"; use_task "$AA_TASK"
@@ -550,14 +642,14 @@ mail_add() { # <task> <from> <to> <kind> <ref> <commit> <branch> <text>: prints 
   mail_lock "$1" || die "the messages of task $1 are busy; try again"
   id=$(awk -F'\t' 'BEGIN { m = 0 } $1 > m { m = $1 } END { print m + 1 }' "$f" 2>/dev/null || echo 1)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tqueued\t-\t0\t-\t%s\n' "$id" "$(date +%s)" "$2" "$3" "$4" "${5:--}" "${6:--}" "${7:--}" "$8" >> "$f"
-  unlock_task
+  mail_unlock
   echo "$id"
 }
 mail_set() { # <id> <field> <value> [<field> <value>]: in this task's messages
   local f; f=$(mail_file "$TASK")
   mail_lock "$TASK" 20 || return 0
   awk -F'\t' -v OFS='\t' -v i="$1" -v k="$2" -v v="$3" -v k2="${4:-0}" -v v2="${5:-}" '$1 == i { $k = v; if (k2) $k2 = v2 } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
-  unlock_task
+  mail_unlock
 }
 sender_wt() { local r="${1%@*}" t="$TASK"; [[ "$1" != *@* ]] || t="${1#*@}"; ( use_task "$t"; wt_dir "$r" ); }   # <from>
 quoted() { # another agent's words, inside quotes it can't close: no quote marks (also Unicode ones), no line breaks, no operator marker
@@ -584,7 +676,7 @@ mail_deliver() { # <agent>: its queued messages, as text for its context; marks 
   mail_lock "$TASK" 20 || return 0   # busy: the next hook delivers them
   out=$(awk -F'\t' -v a="$1" '$4 == a && $9 == "queued"' "$f")
   awk -F'\t' -v OFS='\t' -v a="$1" -v n="$(date +%s)" '$4 == a && $9 == "queued" { $9 = "delivered"; $10 = n } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
-  unlock_task
+  mail_unlock
   [[ -z "$out" ]] || mail_format "$out" "$1"
 }
 listen() { # <task> <agent>: Claude Code runs this in the background (asyncRewake); it wakes an idle agent with its messages
@@ -655,7 +747,7 @@ mail_cmd() { # <command> <args>: send, ask, reply, handoff, wait, inbox; run by 
                    f=$(mail_file "$TASK")   # the handoff ends the receiver's waits for me
                    if [[ -s "$f" ]] && mail_lock "$TASK" 50; then
                      awk -F'\t' -v OFS='\t' -v w="$r" -v me="$ME" '$5 == "wait" && $3 == w && $4 == me && $9 != "closed" { $9 = "closed" } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
-                     unlock_task
+                     mail_unlock
                    fi ;;
         esac
       done ;;
@@ -1129,7 +1221,7 @@ add_repo() { # <path> <agent> [description]
 
 compose_projects_in() { # <folder>: compose projects whose containers were started from inside it
   docker ps -a --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null |
-    awk -F'|' -v d="$1/" '$1 != "" && index($2 "/", d) == 1 { print $1 }' | sort -u
+    awk -F'|' -v d="$1/" '$1 != "" && index($2 "/", d) == 1 { print $1 }' | sort -u || true   # Docker not running: none
 }
 clean_project() { # <compose project>
   local p="$1" f="label=com.docker.compose.project=$1"
@@ -1140,6 +1232,7 @@ clean_project() { # <compose project>
 }
 docker_clean() { # <compose project> [folder]: that project, plus every project started from inside the folder
   command -v docker >/dev/null || return 0
+  docker ps -q >/dev/null 2>&1 || { echo "docker isn't running; nothing to clean up"; return 0; }
   local p list="$1"
   [[ -n "${2:-}" ]] && list+=" $(compose_projects_in "$2" | tr '\n' ' ')"
   for p in $list; do clean_project "$p"; done
@@ -1249,13 +1342,13 @@ pr_refresh() { # writes $ORG_CACHE/prs.tsv: agent, branch, number, state, checks
   for i in "${!R_KEYS[@]}"; do
     in_list "$(basename "${R_PATHS[$i]}")" "$used" || continue
     slug=$(gh_slug "${R_PATHS[$i]}"); [[ -n "$slug" ]] || continue
-    gh pr list -R "$slug" --author @me --state all --limit 40 --json headRefName,number,state,statusCheckRollup 2>/dev/null |
+    gh pr list -R "$slug" --author @me --state all --limit 40 --json headRefName,number,state,statusCheckRollup,url 2>/dev/null |
       jq -r --arg k "${R_KEYS[$i]}" '.[] | [$k, .headRefName, .number, .state,
         ([.statusCheckRollup[]? | (.conclusion // .state // "")] as $c
          | if ($c | length) == 0 then "none"
            elif any($c[]; . == "FAILURE" or . == "ERROR" or . == "CANCELLED" or . == "TIMED_OUT" or . == "ACTION_REQUIRED") then "fail"
            elif all($c[]; . == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED") then "pass"
-           else "pending" end)] | @tsv' >> "$tmp" 2>/dev/null || true
+           else "pending" end), .url] | @tsv' >> "$tmp" 2>/dev/null || true
   done
   mv "$tmp" "$ORG_CACHE/prs.tsv"
   rmdir "$lock" 2>/dev/null || true
@@ -1266,11 +1359,11 @@ pr_refresh_if_old() { # starts a background refresh when the cache is missing or
   ( "$SELF" _prs >/dev/null 2>&1 & ) >/dev/null 2>&1
   return 0
 }
-pr_of() { # <agent> <branch>: "number state checks" of its newest pull request (open ones first), or nothing
+pr_of() { # <agent> <branch>: "number state checks url" of its newest pull request (open ones first), or nothing
   [[ -f "$ORG_CACHE/prs.tsv" ]] || return 0
   awk -F'\t' -v k="$1" -v b="$2" '$1 == k && $2 == b {
       rank = ($4 == "OPEN") ? 3 : ($4 == "MERGED") ? 2 : 1
-      if (rank > br || (rank == br && $3 > bn)) { br = rank; bn = $3; out = $3 " " $4 " " $5 } }
+      if (rank > br || (rank == br && $3 > bn)) { br = rank; bn = $3; out = $3 " " $4 " " $5 " " $6 } }
     END { if (out != "") print out }' "$ORG_CACHE/prs.tsv"
 }
 task_merged() { # <task>: true when every worktree of the task has a merged pull request and no uncommitted changes
@@ -1619,6 +1712,7 @@ monitor_lines() { # [raw]: one row per open task with its numbers, its agents in
     [[ $n_wait -gt 0 ]] && head+="${C_YELLOW}⧗ $n_wait waiting for an agent${C_RESET}  "
     ov=$(overlap_tasks); [[ -z "$ov" ]] || head+="${C_YELLOW}⚠ overlap with $ov${C_RESET}  "
     ov=$(queued_count); [[ "${ov:-0}" -eq 0 ]] || head+="${C_DIM}✉ $ov not delivered yet${C_RESET}  "
+    ov=$(finish_label); [[ -z "$ov" ]] || head+="$ov  "
     [[ $n_stop -gt 0 ]] && head+="${C_DIM}○ $n_stop stopped${C_RESET}  "
     head+="${C_DIM}·${C_RESET} $(plural "$ch" "changed file")"
     [[ $ttok -gt 0 ]] && head+=" · $(tokens_short "$ttok") tokens · ${C_BOLD}$(money "$tusd" "$MON_RATE")${C_RESET} · ${C_DIM}$(model_list "$models")${C_RESET}"
@@ -2289,15 +2383,20 @@ monitor_header() { # the top of the Monitor: who waits for you and since when, t
 task_actions() { # <task>: what you can do with a whole task from the Monitor
   local task="$1" act how msg
   while :; do
-    act=$(printf '%s\n' "open${TAB}Open $task" "all${TAB}Send every agent of $task a message" "down${TAB}Shut down $task" |
+    act=$(printf '%s\n' "open${TAB}Open $task" "all${TAB}Send every agent of $task a message" \
+      "finish${TAB}Finish $task: every agent pushes and opens its pull request" "down${TAB}Shut down $task" |
       pick_one "$task" "the whole task") || return 0
     case "$act" in
       open) how=$(ask_open here) || continue
             [[ "$how" == detached ]] && continue
             run "Opened $task" attach "$task" "--$how" ;;
-      all)  msg=$(ask "Message to every running agent of $task" "Typed into each agent and sent with Enter") || continue
+      all)  msg=$(ask "Message to every agent of $task" "Delivered to each agent at its next step, or when it starts") || continue
             [[ -n "$msg" ]] || continue
             run "Message sent to every running agent of $task" say "$task" all "$msg" ;;
+      finish) printf 'go\tFinish it\n' | pick_one "Finish $task?" \
+                "Each agent commits, pushes and opens its pull request. The PRs get linked, and the task is removed once all are merged (branches stay)" |
+                grep -qx go || continue
+              run "Asked every agent of $task to open its pull request" finish "$task" ;;
       down) flow_down "$task" || continue ;;
     esac
     return 0
@@ -2623,7 +2722,7 @@ pr_label() { # <agent> <branch> <commits>: " · be #123 ✓ checks pass" and the
     [[ "${3:-0}" -gt 0 ]] && printf '%s' " · ${C_DIM}$1: $(plural "$3" commit), no PR${C_RESET}"
     return 0
   fi
-  read -r n st ck <<< "$pr"
+  read -r n st ck _ <<< "$pr"
   case "$st" in
     MERGED) printf '%s' " · ${C_GREEN}$1 #$n merged${C_RESET}" ;;
     CLOSED) printf '%s' " · ${C_DIM}$1 #$n closed${C_RESET}" ;;
@@ -2687,12 +2786,12 @@ interactive() { # [monitor]
 
 usage="usage: $PROG [--org owner] (no arguments: interactive menu) | orgs | org [owner] | up <task> [goal] [--only a,b] [--split|--own] [--remote on|off] [--window|--tab|--here|--detached] | start <task> a[,b] [--split|--own] [--fresh] [--remote on|off] [open] | stop <task> a[,b] | resume <task> [--only a,b] [--split|--own] [--fresh] [--remote on|off] [open] | attach <task> [open] | say <task> <agent> <msg> | ls | repos | add-repo <repo|path> [agent] [description] | remove <task> a[,b] [--force] | down <task> [--prune] | help"
 main() {
-  trap unlock_task EXIT
+  trap 'unlock_task; mail_unlock' EXIT
   if [[ "${1:-}" == --org ]]; then [[ -n "${2:-}" ]] || die "--org needs a GitHub owner"; AA_ORG="$2"; ORG_FROM_ENV="$2"; shift 2; fi
   resolve_org
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_listen|_inv|inventory|_usage|_activity|_hook|_notify) ;;
+    ""|menu|monitor|help|-h|--help|selftest|orgs|org|_ticker|_feed|_spin|_listen|next|_inv|inventory|_usage|_activity|_hook|_notify) ;;
     *) need_org ;;
   esac
   case "$cmd" in
@@ -2704,10 +2803,10 @@ main() {
     _monitor) monitor_lines ;;
     _monitor_header) monitor_header ;;
     help|-h|--help) sed -n '2,/^set -euo/p' "$SELF" | sed -e '$d' -e 's/^# \{0,1\}//' ;;
-    up|resume|attach|down)
+    up|resume|attach|down|finish)
       check_task "${1:-}"; use_task "$1"; shift; parse "$@"
       [[ "$cmd" == attach ]] || { lock_task || die "task $TASK is busy with another $PROG command; try again"; }
-      case "$cmd" in up) up ;; resume) resume ;; attach) open_view "${OPEN:-here}" ;; down) down ;; esac ;;
+      case "$cmd" in up) up ;; resume) resume ;; attach) open_view "${OPEN:-here}" ;; down) down ;; finish) finish ;; esac ;;
     start|stop|say|remove|restart)
       check_task "${1:-}"; use_task "$1"
       [[ "$cmd" == say ]] || { lock_task || die "task $1 is busy with another $PROG command; try again"; }
@@ -2728,6 +2827,8 @@ main() {
     _header)  main_header ;;
     _notify)  notify "$@" ;;
     _hook)    hook "$@" 3>&1 >/dev/null 2>&1 </dev/stdin || true ;;   # only a decision (fd 3) reaches Claude Code
+    next)     next_agent "$@" ;;
+    _finish_step) check_task "${1:-}"; use_task "$1"; finish_watch ;;
     _listen)  rc=0; listen "${1:?task}" "${2:?agent}" 3>&2 >/dev/null 2>&1 </dev/stdin || rc=$?; exit "$rc" ;;   # only the messages reach stderr
     _watch)   watch "${1:?task}" ;;
     _usage)    agent_usage "${1:?worktree}" ;;

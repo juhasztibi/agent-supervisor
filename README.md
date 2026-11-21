@@ -51,6 +51,7 @@ Optional tmux keys (add to `~/.tmux.conf`):
 ```tmux
 bind a display-popup -E -w 90% -h 90% "AA_POPUP=1 AA_OPEN=here ~/.local/bin/ai-agents"   # prefix + a: the menu
 bind O run-shell "~/.local/bin/ai-agents monitor-pane '#{pane_id}'"                       # prefix + O: monitor on the side
+bind J run-shell "~/.local/bin/ai-agents next '#{pane_id}'"                               # prefix + J: the agent waiting for you
 ```
 
 ## Daily use
@@ -58,9 +59,9 @@ bind O run-shell "~/.local/bin/ai-agents monitor-pane '#{pane_id}'"             
 1. **Open the menu:** `ai-agents`, or `prefix + a` in tmux. Pick the organisation (the last one is on top, so Enter).
 2. **Start work:** `1 Start new agents` → new task, or a task from a GitHub issue → tick the repositories → model and effort per agent → the goal. The agents open in a new window and start.
 3. **Keep an eye on them:** `m` or `7 Monitor`. Tasks that need you are on top. Enter on an agent: open it, send it a message, change its model, stop it.
-4. **Answer when asked:** a notification tells you which task and agent waits. `2 Running agents` opens it.
+4. **Answer when asked:** a notification tells you which task and agent waits. `prefix + J` takes you to the agent that has waited longest; press it again for the next one.
 5. **Next morning:** `3 Resume agents` continues the conversations where they stopped.
-6. **Done:** `5 Remove agents` stops them and deletes worktrees, panes and the task's Docker containers. Branches stay.
+6. **Done:** in the Monitor, Enter on the task, then "Finish". Every agent commits, pushes and opens its pull request, the pull requests get linked to each other, and the task removes itself once all are merged (branches stay). `5 Remove agents` removes a task right away.
 
 Keys in every screen: Enter chooses, Esc or `← Back` goes back, type to search. On the overview: `1`-`8` jump, `m` monitor, `o` switch organisation, `r` refresh, `q` quit.
 
@@ -87,6 +88,8 @@ ai-agents up <task> "goal" --only api,web     # new task with these agents
 ai-agents start <task> api --model opus       # start or add an agent
 ai-agents say <task> all "rebase on main"     # type a message into every running agent
 ai-agents ls                                   # what runs where
+ai-agents finish <task>                        # every agent opens its pull request; cleans up once merged
+ai-agents next                                 # go to the agent that has waited longest for you
 ai-agents stop <task> web | resume <task> | down <task> --prune
 ai-agents orgs | org <owner> | --org <owner> <command>
 ai-agents help                                 # everything else

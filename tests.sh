@@ -61,9 +61,16 @@ case "$1 $2" in
   "api user")       printf 'tester\tyour own repositories\n' ;;
   "api --paginate") [[ -z "${FAKE_GH_FAIL:-}" ]] || exit 1; printf 'testorg\tA test organisation\n' ;;
   "repo list")      printf 'newrepo\tOnly on GitHub\napi\tThe backend\n' ;;
+  "pr comment")     echo "$3 :: $5" >> "$FAKE_GHC" ;;
   "repo clone")     git clone -q "$FAKE_REMOTES/${3#*/}.git" "$4" && git -C "$4" remote set-url origin "https://github.com/$3.git" ;;
   *)                exit 1 ;;
 esac
+EOF
+cat > "$T/bin/docker" <<'EOF'
+#!/bin/bash
+# fake docker: never touches your real containers; DOCKER_DOWN=1 behaves like a stopped Docker
+[[ -z "${DOCKER_DOWN:-}" ]] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+exit 0
 EOF
 chmod +x "$T/bin/"*
 
@@ -78,7 +85,7 @@ done
 export PATH="$T/bin:$PATH" AA_WT_ROOT="$T/wt" AA_CONFIG_DIR="$T/cfg" XDG_CACHE_HOME="$T/cache" \
   AA_ORG=testorg AA_CLONE_ROOT="$T/clones" FAKE_REMOTES="$T/repos" AA_PREFIX=tst AA_OPEN=detached \
   AA_REPO_ROOTS="$T/repos" AA_CLAUDE_PROJECTS="$T/projects" AA_CURRENCY=CHF AA_USD_RATE=0.8 AA_WATCH_SEC=1 AA_STUCK_SEC=3 AA_REMIND_SEC=3 AA_DELIVER_SEC=2 AA_ANSWER_SEC=3 AA_WAIT_SEC=3 \
-  FAKE_LOG="$T/fake.log" OSA_LOG="$T/osa.log"
+  FAKE_LOG="$T/fake.log" OSA_LOG="$T/osa.log" FAKE_GHC="$T/gh-comments.log"
 unset TMUX CLAUDECODE AA_ISSUE_REPO AA_BE_REPO AA_UI_REPO
 : > "$FAKE_LOG"; : > "$OSA_LOG"
 tmux new-session -d -s boot
@@ -349,6 +356,44 @@ eq "with unique ids" "$(grep -c . "$M")" "$(cut -f1 "$M" | sort -u | grep -c .)"
 eq "and every line is whole" "0" "$(awk -F'\t' 'NF != 13' "$M" | grep -c . || true)"
 "$A" down t5 --prune >/dev/null 2>&1
 
+section "Jump to the agent that waits for you"
+"$A" up t11 --only be,ui --goal x >/dev/null 2>&1
+wait_for 5 running t11 ui && wait_for 5 grep -q idle "$W/t11/ui.state"
+eq "nobody waiting: it says so" "Nobody is waiting for you" "$("$A" next --print)"
+printf 'needs-you\t%s\tBash: git push\n' "$(( $(date +%s) - 300 ))" > "$W/t11/be.state"
+printf 'needs-you\t%s\tEdit: a.ts\n' "$(( $(date +%s) - 60 ))" > "$W/t11/ui.state"
+pb=$(pane t11 be); pu=$(pane t11 ui)
+has "it goes to the agent that has waited longest" "^$pb" "$("$A" next --print)"
+has "and says what it waits for" "Bash: git push" "$("$A" next --print)"
+has "pressed again on it, it goes to the next one" "^$pu" "$("$A" next "$pb" --print)"
+has "after the last one it starts over" "^$pb" "$("$A" next "$pu" --print)"
+"$A" down t11 --prune >/dev/null 2>&1
+
+section "Finishing a task"
+"$A" up t12 --only be,ui --goal x >/dev/null 2>&1
+wait_for 5 running t12 ui && wait_for 5 grep -q idle "$W/t12/ui.state"; "$A" stop t12 ui >/dev/null 2>&1
+out=$("$A" finish t12 2>&1); has "finish asks every agent to wrap up" "asked be,ui" "$out"
+has "and starts the stopped ones" "started ui" "$out"
+wait_for 5 running t12 ui && ok "the stopped agent runs again" || bad "the stopped agent runs again"
+has "each agent is told to push and open a pull request" "push branch t12, and open a pull request" "$(awk -F'\t' '$4 == "be"' "$W/t12/messages.tsv")"
+wait_for 5 bash -c "awk -F'\t' '\$4 == \"ui\" { print \$9 }' '$W/t12/messages.tsv' | grep -q delivered" && ok "the restarted agent gets it when it starts" || bad "the restarted agent gets it when it starts"
+has "the monitor shows the task is finishing" "finishing: 0 of 2 pull requests" "$(AA_COLOR= "$A" _monitor)"
+C="$T/cache/ai-agents/orgs/testorg/prs.tsv"; mkdir -p "${C%/*}"
+wait_for 10 bash -c '! pgrep -f "_prs" >/dev/null'   # the background refresh finish started must not overwrite our data
+: > "$FAKE_GHC"
+printf 'be\tt12\t11\tOPEN\tpass\thttps://github.com/o/api/pull/11\nui\tt12\t22\tOPEN\tnone\thttps://github.com/o/web/pull/22\n' > "$C"
+has "with both pull requests open it waits for review" "waiting for review: 2 pull requests" "$(AA_COLOR= "$A" _monitor)"
+"$A" _finish_step t12 >/dev/null 2>&1   # the watchdog may have done it already: either way exactly once
+has "the pull requests are linked to each other" "pull/11 :: .*pull/22" "$(cat "$FAKE_GHC")"
+has "both ways" "pull/22 :: .*pull/11" "$(cat "$FAKE_GHC")"
+"$A" _finish_step t12 >/dev/null 2>&1; eq "only once" "2" "$(grep -c . "$FAKE_GHC")"
+printf 'be\tt12\t11\tMERGED\tpass\thttps://github.com/o/api/pull/11\nui\tt12\t22\tMERGED\tnone\thttps://github.com/o/web/pull/22\n' > "$C"
+: > "$OSA_LOG"; "$A" _finish_step t12 >/dev/null 2>&1
+wait_for 15 test ! -d "$W/t12" && ok "once everything is merged the task is removed" || bad "once everything is merged the task is removed"
+has "and you are told" "t12 merged" "$(cat "$OSA_LOG")"
+has "the branches stay" "t12" "$(git -C "$T/repos/api" branch --list t12)"
+rm -f "$C"
+
 section "Overlap between tasks"
 "$A" up t8 --only be --goal x >/dev/null 2>&1; "$A" up t9 --only be --goal y >/dev/null 2>&1
 echo a > "$W/t8/api/shared.txt"; git -C "$W/t8/api" add shared.txt
@@ -441,8 +486,8 @@ echo dirty > "$W/t1/api/y.txt"
 out=$("$A" down t1 --prune 2>&1); has "prune refuses uncommitted changes" "uncommitted" "$out"
 check "nothing was removed" test -d "$W/t1/api"
 rm "$W/t1/api/y.txt"
-"$A" down t1 --prune >/dev/null 2>&1
-check "down --prune removes the task folder" test ! -d "$W/t1"
+out=$(DOCKER_DOWN=1 "$A" down t1 --prune 2>&1); has "a stopped Docker is reported" "docker isn't running" "$out"
+check "down --prune removes the task folder, also with Docker stopped" test ! -d "$W/t1"
 tmux has-session -t =tst-t1 2>/dev/null && bad "down closes the tmux session" || ok "down closes the tmux session"
 has "the branch stays after down" "t1" "$(git -C "$T/repos/api" branch --list t1)"
 
