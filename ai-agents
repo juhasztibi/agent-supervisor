@@ -381,8 +381,8 @@ on run argv
 end run
 EOF
 }
-LOCKED=""
-lock_at() { # <lock dir> [tries of 0.1 s]: waits for the lock; fails when it stays busy
+LOCKED="" GOT=""
+lock_at() { # <lock dir> [tries of 0.1 s]: waits for the lock and sets GOT; fails when it stays busy
   local d="$1" i=0 max="${2:-600}"
   mkdir -p "${d%/*}"
   until mkdir "$d" 2>/dev/null; do
@@ -390,10 +390,12 @@ lock_at() { # <lock dir> [tries of 0.1 s]: waits for the lock; fails when it sta
     i=$((i + 1)); [[ $i -lt $max ]] || return 1
     sleep 0.1
   done
-  LOCKED="$d"
+  GOT="$d"
 }
-lock_task() { lock_at "$WT_ROOT/.$TASK.lock" "${1:-600}"; }   # [tries]: one command at a time changes a task (agents run start themselves)
+lock_task() { lock_at "$WT_ROOT/.$TASK.lock" "${1:-600}" && LOCKED="$GOT"; }   # [tries]   # [tries]: one command at a time changes a task (agents run start themselves)
 unlock_task() { [[ -z "$LOCKED" ]] || rmdir "$LOCKED" 2>/dev/null; LOCKED=""; return 0; }
+MAIL_LOCKED=""   # its own variable: messages are queued while a command holds the task lock
+mail_unlock() { [[ -z "$MAIL_LOCKED" ]] || rmdir "$MAIL_LOCKED" 2>/dev/null; MAIL_LOCKED=""; return 0; }
 watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$WT_ROOT/$TASK/watchdog.log"; }
 watch_start() { # starts the task's watchdog unless it already runs
   local pidf="$WT_ROOT/$TASK/.watch.pid" pid
@@ -531,7 +533,7 @@ EOF
 # ever typed into it. The watchdog tells you about messages it can't deliver, questions left unanswered and long waits.
 clean_text() { printf '%s' "$1" | tr '[:cntrl:]' ' ' | cut -c1-500; }   # one line, no terminal control codes
 mail_file() { echo "$WT_ROOT/$1/messages.tsv"; }                        # <task>
-mail_lock() { lock_at "$WT_ROOT/.$1.mail.lock" "${2:-100}"; }            # <task> [tries]
+mail_lock() { lock_at "$WT_ROOT/.$1.mail.lock" "${2:-100}" && MAIL_LOCKED="$GOT"; }            # <task> [tries]
 me_agent() { # the agent session that runs this command: sets ME and the task (agents started by us have AA_AGENT and AA_TASK)
   [[ -n "${AA_AGENT:-}" && -n "${AA_TASK:-}" ]] || die "run this from an agent session (it reads AA_AGENT and AA_TASK, which $PROG sets for its agents)"
   check_task "$AA_TASK"; use_task "$AA_TASK"
@@ -550,14 +552,14 @@ mail_add() { # <task> <from> <to> <kind> <ref> <commit> <branch> <text>: prints 
   mail_lock "$1" || die "the messages of task $1 are busy; try again"
   id=$(awk -F'\t' 'BEGIN { m = 0 } $1 > m { m = $1 } END { print m + 1 }' "$f" 2>/dev/null || echo 1)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tqueued\t-\t0\t-\t%s\n' "$id" "$(date +%s)" "$2" "$3" "$4" "${5:--}" "${6:--}" "${7:--}" "$8" >> "$f"
-  unlock_task
+  mail_unlock
   echo "$id"
 }
 mail_set() { # <id> <field> <value> [<field> <value>]: in this task's messages
   local f; f=$(mail_file "$TASK")
   mail_lock "$TASK" 20 || return 0
   awk -F'\t' -v OFS='\t' -v i="$1" -v k="$2" -v v="$3" -v k2="${4:-0}" -v v2="${5:-}" '$1 == i { $k = v; if (k2) $k2 = v2 } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
-  unlock_task
+  mail_unlock
 }
 sender_wt() { local r="${1%@*}" t="$TASK"; [[ "$1" != *@* ]] || t="${1#*@}"; ( use_task "$t"; wt_dir "$r" ); }   # <from>
 quoted() { # another agent's words, inside quotes it can't close: no quote marks (also Unicode ones), no line breaks, no operator marker
@@ -584,7 +586,7 @@ mail_deliver() { # <agent>: its queued messages, as text for its context; marks 
   mail_lock "$TASK" 20 || return 0   # busy: the next hook delivers them
   out=$(awk -F'\t' -v a="$1" '$4 == a && $9 == "queued"' "$f")
   awk -F'\t' -v OFS='\t' -v a="$1" -v n="$(date +%s)" '$4 == a && $9 == "queued" { $9 = "delivered"; $10 = n } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
-  unlock_task
+  mail_unlock
   [[ -z "$out" ]] || mail_format "$out" "$1"
 }
 listen() { # <task> <agent>: Claude Code runs this in the background (asyncRewake); it wakes an idle agent with its messages
@@ -655,7 +657,7 @@ mail_cmd() { # <command> <args>: send, ask, reply, handoff, wait, inbox; run by 
                    f=$(mail_file "$TASK")   # the handoff ends the receiver's waits for me
                    if [[ -s "$f" ]] && mail_lock "$TASK" 50; then
                      awk -F'\t' -v OFS='\t' -v w="$r" -v me="$ME" '$5 == "wait" && $3 == w && $4 == me && $9 != "closed" { $9 = "closed" } { print }' "$f" > "$f.$$" && mv "$f.$$" "$f"
-                     unlock_task
+                     mail_unlock
                    fi ;;
         esac
       done ;;
@@ -2687,7 +2689,7 @@ interactive() { # [monitor]
 
 usage="usage: $PROG [--org owner] (no arguments: interactive menu) | orgs | org [owner] | up <task> [goal] [--only a,b] [--split|--own] [--remote on|off] [--window|--tab|--here|--detached] | start <task> a[,b] [--split|--own] [--fresh] [--remote on|off] [open] | stop <task> a[,b] | resume <task> [--only a,b] [--split|--own] [--fresh] [--remote on|off] [open] | attach <task> [open] | say <task> <agent> <msg> | ls | repos | add-repo <repo|path> [agent] [description] | remove <task> a[,b] [--force] | down <task> [--prune] | help"
 main() {
-  trap unlock_task EXIT
+  trap 'unlock_task; mail_unlock' EXIT
   if [[ "${1:-}" == --org ]]; then [[ -n "${2:-}" ]] || die "--org needs a GitHub owner"; AA_ORG="$2"; ORG_FROM_ENV="$2"; shift 2; fi
   resolve_org
   local cmd="${1:-}"; shift || true
